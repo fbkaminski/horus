@@ -1,17 +1,24 @@
 const std = @import("std");
 
-pub const NodeId = [32]u8; // or [20]u8 for 160-bit
-pub const Key = [32]u8;
+pub const DhtNodeId = [32]u8;
+pub const DhtKey = [32]u8;
 
-pub const NodeInfo = struct {
-    id: NodeId,
+pub const DhtNodeEntry = struct {
+    id: DhtNodeId,
     addr: std.net.Address,
 };
 
-pub const DhtMessage = struct {
+pub const DhtMessageHeader = packed struct {
+    magic: [4]u8,
+    version: u8,
+    msg_type: u4,
+    flags: u4,
     transaction_id: u16,
-    sender_id: NodeId,
+    sender_id: DhtNodeId,
+};
 
+pub const DhtMessage = struct {
+    header: DhtMessageHeader,
     payload: union(enum) {
         request: DhtRequest,
         response: DhtResponse,
@@ -20,38 +27,15 @@ pub const DhtMessage = struct {
 
 pub const DhtRequest = union(enum) {
     ping: void,
-    get_peers: struct {
-        info_hash: Key,
-        noseed: ?bool,
-        scrape: ?bool,
-        want: ?[]NodeId,
-    },
-    find_node: struct {
-        target: NodeId,
-        want: ?[]NodeId,
-    },
-    announce_peer: struct {
-        infohash: Key,
-        port: i16,
-        token: []u8,
-        n: ?[]u8,
-        seed: ?i32,
-        implied_port: ?i16,
-    },
-    put: struct {
-        key: Key,
+    store: struct {
+        key: DhtKey,
         value: []const u8,
-        // mutable puts
-        seq: ?i32,
-        pubkey: ?[]u8,
-        signature: ?[]u8,
-        cas: ?i32,
-        salt: ?[]u8,
+        signature: []u8,
+        seq: i32,
     },
-    get: struct {
-        key: Key,
-        seq: ?i32,
-        want: ?[]NodeId,
+    find_node: struct { target: DhtNodeId },
+    find_value: struct {
+        key: DhtKey,
     },
 };
 
@@ -59,7 +43,7 @@ pub const DhtResponse = union(enum) {
     pong: void,
     store_ok: void,
     nodes: struct {
-        nodes: []const NodeInfo,
+        nodes: []const DhtNodeEntry,
     },
     // find_value can return either nodes or the value
     value: struct {

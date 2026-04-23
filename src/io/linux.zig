@@ -1,0 +1,1616 @@
+const std = @import("std");
+const builtin = @import("builtin");
+const assert = std.debug.assert;
+const os = std.os;
+const posix = std.posix;
+const linux = os.linux;
+const IO_Uring = linux.IoUring;
+const io_uring_cqe = linux.io_uring_cqe;
+const io_uring_sqe = linux.io_uring_sqe;
+const log = std.log.scoped(.io);
+
+const common = @import("./common.zig");
+const QueueType = @import("queue.zig").QueueType;
+const DoublyLinkedListType = @import("list.zig").DoublyLinkedListType;
+
+const tick_ms: u63 = 10;
+const sector_size = 4096;
+
+pub const IO = struct {
+    pub const TCPOptions = common.TCPOptions;
+    pub const ListenOptions = common.ListenOptions;
+    pub const Stats = common.Stats;
+    const CompletionList = DoublyLinkedListType(Completion, .awaiting_back, .awaiting_next);
+
+    ring: IO_Uring,
+
+    /// Operations not yet submitted to the kernel and waiting on available space in the
+    /// submission queue.
+    unqueued: QueueType(Completion) = QueueType(Completion).init(.{ .name = "io_unqueued" }),
+
+    /// Completions that are ready to have their callbacks run.
+    completed: QueueType(Completion) = QueueType(Completion).init(.{ .name = "io_completed" }),
+
+    // TODO Track these as metrics:
+    ios_queued: u32 = 0,
+    ios_in_kernel: u32 = 0,
+
+    /// The head of a doubly-linked list of all operations that are:
+    /// - in the submission queue, or
+    /// - in the kernel, or
+    /// - in the completion queue, or
+    /// - in the `completed` list (excluding zero-duration timeouts).
+    awaiting: CompletionList = .{},
+
+    // This is the completion that performs the cancellation.
+    // This is *not* the completion that is being canceled.
+    cancel_completion: Completion = undefined,
+
+    cancel_all_status: union(enum) {
+        // Not canceling.
+        inactive,
+        // Waiting to start canceling the next awaiting operation.
+        next,
+        // The target's cancellation SQE is queued; waiting for the cancellation's completion.
+        queued: struct { target: *Completion },
+        // Currently canceling the target operation.
+        wait: struct { target: *Completion },
+        // All operations have been canceled.
+        done,
+    } = .inactive,
+
+    pub fn init(entries: u12, flags: u32) !IO {
+        // Detect the linux version to ensure that we support all io_uring ops used.
+        const uts = posix.uname();
+        const version = try parse_dirty_semver(&uts.release);
+        if (version.order(std.SemanticVersion{ .major = 5, .minor = 5, .patch = 0 }) == .lt) {
+            @panic("Linux kernel 5.5 or greater is required for io_uring OP_ACCEPT");
+        }
+
+        errdefer |err| switch (err) {
+            error.SystemOutdated => {
+                log.err("io_uring is not available", .{});
+                log.err("likely cause: the syscall is disabled by seccomp", .{});
+            },
+            error.PermissionDenied => {
+                log.err("io_uring is not available", .{});
+                log.err("likely cause: the syscall is disabled by sysctl, " ++
+                    "try 'sysctl -w kernel.io_uring_disabled=0'", .{});
+            },
+            else => {},
+        };
+
+        return IO{ .ring = try IO_Uring.init(entries, flags) };
+    }
+
+    pub fn deinit(self: *IO) void {
+        self.ring.deinit();
+    }
+
+    /// Pass all queued submissions to the kernel and peek for completions.
+    pub fn run(self: *IO) !void {
+        assert(self.cancel_all_status != .done);
+
+        // We assume that all timeouts submitted by `run_for_ns()` will be reaped by `run_for_ns()`
+        // and that `tick()` and `run_for_ns()` cannot be run concurrently.
+        // Therefore `timeouts` here will never be decremented and `etime` will always be false.
+        var timeouts: usize = 0;
+        var etime = false;
+
+        try self.flush(0, &timeouts, &etime);
+        assert(etime == false);
+
+        // Flush any SQEs that were queued while running completion callbacks in `flush()`:
+        // This is an optimization to avoid delaying submissions until the next tick.
+        // At the same time, we do not flush any ready CQEs since SQEs may complete synchronously.
+        // We guard against an io_uring_enter() syscall if we know we do not have any queued SQEs.
+        // We cannot use `self.ring.sq_ready()` here since this counts flushed and unflushed SQEs.
+        const queued = self.ring.sq.sqe_tail -% self.ring.sq.sqe_head;
+        if (queued > 0) {
+            try self.flush_submissions(0, &timeouts, &etime);
+            assert(etime == false);
+        }
+    }
+
+    /// Pass all queued submissions to the kernel and run for `nanoseconds`.
+    /// The `nanoseconds` argument is a u63 to allow coercion to the i64 used
+    /// in the kernel_timespec struct.
+    pub fn run_for_ns(self: *IO, nanoseconds: u63) !void {
+        assert(self.cancel_all_status != .done);
+        //defer self.stats.trace();
+
+        //var timer = try std.time.Timer.start();
+        //defer self.stats.now.time_run_for_ns.ns += timer.read();
+
+        // We must use the same clock source used by io_uring (CLOCK_MONOTONIC) since we specify the
+        // timeout below as an absolute value. Otherwise, we may deadlock if the clock sources are
+        // dramatically different. Any kernel that supports io_uring will support CLOCK_MONOTONIC.
+        const current_ts = posix.clock_gettime(posix.CLOCK.MONOTONIC) catch unreachable;
+        // The absolute CLOCK_MONOTONIC time after which we may return from this function:
+        const timeout_ts: os.linux.kernel_timespec = .{
+            .sec = current_ts.sec,
+            .nsec = current_ts.nsec + nanoseconds,
+        };
+        var timeouts: usize = 0;
+        var etime = false;
+        while (!etime) {
+            const timeout_sqe = self.ring.get_sqe() catch blk: {
+                // The submission queue is full, so flush submissions to make space:
+                try self.flush_submissions(0, &timeouts, &etime);
+                break :blk self.ring.get_sqe() catch unreachable;
+            };
+            // Submit an absolute timeout that will be canceled if any other SQE completes first:
+            timeout_sqe.prep_timeout(&timeout_ts, 1, os.linux.IORING_TIMEOUT_ABS);
+            timeout_sqe.user_data = 0;
+            timeouts += 1;
+
+            // We don't really want to count this timeout as an io,
+            // but it's tricky to track separately.
+            self.ios_queued += 1;
+
+            // The amount of time this call will block is bounded by the timeout we just submitted:
+            try self.flush(1, &timeouts, &etime);
+        }
+        // Reap any remaining timeouts, which reference the timespec in the current stack frame.
+        // The busy loop here is required to avoid a potential deadlock, as the kernel determines
+        // when the timeouts are pushed to the completion queue, not us.
+        while (timeouts > 0) _ = try self.flush_completions(0, &timeouts, &etime);
+    }
+
+    fn flush(self: *IO, wait_nr: u32, timeouts: *usize, etime: *bool) !void {
+        // Flush any queued SQEs and reuse the same syscall to wait for completions if required:
+        try self.flush_submissions(wait_nr, timeouts, etime);
+        // We can now just peek for any CQEs without waiting and without another syscall:
+        try self.flush_completions(0, timeouts, etime);
+
+        // The SQE array is empty from flush_submissions(). Fill it up with unqueued completions.
+        // This runs before `self.completed` is flushed below to prevent new IO from reserving SQE
+        // slots and potentially starving those in `self.unqueued`.
+        // Loop over a copy to avoid an infinite loop of `enqueue()` re-adding to `self.unqueued`.
+        {
+            var copy = self.unqueued;
+            self.unqueued.reset();
+            while (copy.pop()) |completion| self.enqueue(completion);
+        }
+
+        //var timer = try std.time.Timer.start();
+
+        // Run completions only after all completions have been flushed:
+        // Loop until all completions are processed. Calls to complete() may queue more work
+        // and extend the duration of the loop, but this is fine as it 1) executes completions
+        // that become ready without going through another syscall from flush_submissions() and
+        // 2) potentially queues more SQEs to take advantage more of the next flush_submissions().
+        while (self.completed.pop()) |completion| {
+            if (completion.operation == .timeout and
+                completion.operation.timeout.timespec.sec == 0 and
+                completion.operation.timeout.timespec.nsec == 0)
+            {
+                // Zero-duration timeouts are a special case, and aren't listed in `awaiting`.
+                maybe(self.awaiting.empty());
+                assert(completion.result == -@as(i32, @intFromEnum(posix.E.TIME)));
+                assert(completion.awaiting_back == null);
+                assert(completion.awaiting_next == null);
+            } else {
+                assert(!self.awaiting.empty());
+                self.awaiting.remove(completion);
+            }
+
+            switch (self.cancel_all_status) {
+                .inactive => completion.complete(),
+                .next => {},
+                .queued => if (completion.operation == .cancel) completion.complete(),
+                .wait => |wait| if (wait.target == completion) {
+                    self.cancel_all_status = .next;
+                },
+                .done => unreachable,
+            }
+        }
+
+        //self.stats.now.time_callbacks.ns += timer.read();
+
+        // At this point, unqueued could have completions either by 1) those who didn't get an SQE
+        // during the popping of unqueued or 2) completion.complete() which start new IO. These
+        // unqueued completions will get priority to acquiring SQEs on the next flush().
+    }
+
+    fn flush_completions(self: *IO, wait_nr: u32, timeouts: *usize, etime: *bool) !void {
+        var cqes: [256]io_uring_cqe = undefined;
+        var wait_remaining = wait_nr;
+        while (true) {
+            // Guard against waiting indefinitely (if there are too few requests inflight),
+            // especially if this is not the first time round the loop:
+            const completed = self.ring.copy_cqes(&cqes, wait_remaining) catch |err| switch (err) {
+                error.SignalInterrupt => continue,
+                else => return err,
+            };
+            if (completed > wait_remaining) wait_remaining = 0 else wait_remaining -= completed;
+            for (cqes[0..completed]) |cqe| {
+                self.ios_in_kernel -= 1;
+
+                if (cqe.user_data == 0) {
+                    timeouts.* -= 1;
+                    // We are only done if the timeout submitted was completed due to time, not if
+                    // it was completed due to the completion of an event, in which case `cqe.res`
+                    // would be 0. It is possible for multiple timeout operations to complete at the
+                    // same time if the nanoseconds value passed to `run_for_ns()` is very short.
+                    if (-cqe.res == @intFromEnum(posix.E.TIME)) etime.* = true;
+                    continue;
+                }
+                const completion: *Completion = @ptrFromInt(cqe.user_data);
+                completion.result = cqe.res;
+                // We do not run the completion here (instead appending to a linked list) to avoid:
+                // * recursion through `flush_submissions()` and `flush_completions()`,
+                // * unbounded stack usage, and
+                // * confusing stack traces.
+                self.completed.push(completion);
+            }
+
+            if (completed < cqes.len) break;
+        }
+    }
+
+    fn flush_submissions(self: *IO, wait_nr: u32, timeouts: *usize, etime: *bool) !void {
+        while (true) {
+            const submitted = self.ring.submit_and_wait(wait_nr) catch |err| switch (err) {
+                error.SignalInterrupt => continue,
+                // Wait for some completions and then try again:
+                // See https://github.com/axboe/liburing/issues/281 re: error.SystemResources.
+                // Be careful also that copy_cqes() will flush before entering to wait (it does):
+                // https://github.com/axboe/liburing/commit/35c199c48dfd54ad46b96e386882e7ac341314c5
+                error.CompletionQueueOvercommitted, error.SystemResources => {
+                    try self.flush_completions(1, timeouts, etime);
+                    continue;
+                },
+                else => return err,
+            };
+
+            self.ios_queued -= submitted;
+            self.ios_in_kernel += submitted;
+
+            break;
+        }
+    }
+
+    fn enqueue(self: *IO, completion: *Completion) void {
+        switch (self.cancel_all_status) {
+            .inactive => {},
+            .queued => assert(completion.operation == .cancel),
+            else => unreachable,
+        }
+
+        const sqe = self.ring.get_sqe() catch |err| switch (err) {
+            error.SubmissionQueueFull => {
+                self.unqueued.push(completion);
+                return;
+            },
+        };
+        completion.prep(sqe);
+
+        self.awaiting.push(completion);
+        self.ios_queued += 1;
+    }
+
+    /// Cancel should be invoked at most once, before any of the memory owned by read/recv buffers
+    /// is freed (so that lingering async operations do not write to them).
+    ///
+    /// After this function is invoked:
+    /// - No more completion callbacks will be called.
+    /// - No more IO may be submitted.
+    ///
+    /// This function doesn't return until either:
+    /// - All events submitted to io_uring have completed.
+    ///   (They may complete with `error.Canceled`).
+    /// - Or, an io_uring error occurs.
+    ///
+    /// TODO(Linux):
+    /// - Linux kernel ≥5.19 supports the IORING_ASYNC_CANCEL_ALL and IORING_ASYNC_CANCEL_ANY flags,
+    ///   which would allow all events to be cancelled simultaneously with a single "cancel"
+    ///   operation, without IO needing to maintain the `awaiting` doubly-linked list and the `next`
+    ///   cancellation stage.
+    /// - Linux kernel ≥6.0 supports `io_uring_register_sync_cancel` which would remove the `queued`
+    ///   cancellation stage.
+    pub fn cancel_all(self: *IO) void {
+        assert(self.cancel_all_status == .inactive);
+
+        // Even if we return early due to an io_uring error, IO won't allow more operations.
+        defer self.cancel_all_status = .done;
+
+        self.cancel_all_status = .next;
+
+        // Discard any operations that haven't started yet.
+        while (self.unqueued.pop()) |_| {}
+
+        while (self.awaiting.tail) |target| {
+            assert(!self.awaiting.empty());
+            assert(self.cancel_all_status == .next);
+            assert(target.operation != .cancel);
+
+            self.cancel_all_status = .{ .queued = .{ .target = target } };
+
+            self.cancel(
+                *IO,
+                self,
+                cancel_all_callback,
+                .{
+                    .completion = &self.cancel_completion,
+                    .target = target,
+                },
+            );
+
+            while (self.cancel_all_status == .queued or self.cancel_all_status == .wait) {
+                self.run_for_ns(tick_ms * std.time.ns_per_ms) catch |err| {
+                    std.debug.panic("IO.cancel_all: run_for_ns error: {}", .{err});
+                };
+            }
+            assert(self.cancel_all_status == .next);
+        }
+        assert(self.awaiting.empty());
+        assert(self.ios_queued == 0);
+        assert(self.ios_in_kernel == 0);
+    }
+
+    fn cancel_all_callback(self: *IO, completion: *Completion, result: CancelError!void) void {
+        assert(self.cancel_all_status == .queued);
+        assert(completion == &self.cancel_completion);
+        assert(completion.operation == .cancel);
+        assert(completion.operation.cancel.target == self.cancel_all_status.queued.target);
+
+        self.cancel_all_status = status: {
+            result catch |err| switch (err) {
+                error.NotRunning => break :status .next,
+                error.NotInterruptable => {},
+                error.Unexpected => unreachable,
+            };
+            // Wait for the target operation to complete or abort.
+            break :status .{ .wait = .{ .target = self.cancel_all_status.queued.target } };
+        };
+    }
+
+    pub const CancelError = error{
+        NotRunning,
+        NotInterruptable,
+    } || posix.UnexpectedError;
+
+    pub fn cancel(
+        self: *IO,
+        comptime Context: type,
+        context: Context,
+        comptime callback: fn (
+            context: Context,
+            completion: *Completion,
+            result: CancelError!void,
+        ) void,
+        options: struct {
+            completion: *Completion,
+            target: *Completion,
+        },
+    ) void {
+        options.completion.* = .{
+            .io = self,
+            .context = context,
+            .callback = erase_types(Context, CancelError!void, callback),
+            .operation = .{ .cancel = .{ .target = options.target } },
+        };
+
+        self.enqueue(options.completion);
+    }
+
+    /// This struct holds the data needed for a single io_uring operation.
+    pub const Completion = struct {
+        io: *IO,
+        result: i32 = undefined,
+        link: QueueType(Completion).Link = .{},
+        operation: Operation,
+        context: ?*anyopaque,
+        callback: *const fn (
+            context: ?*anyopaque,
+            completion: *Completion,
+            result: *const anyopaque,
+        ) void,
+
+        /// Used by the `IO.awaiting` doubly-linked list.
+        awaiting_back: ?*Completion = null,
+        awaiting_next: ?*Completion = null,
+
+        fn prep(completion: *Completion, sqe: *io_uring_sqe) void {
+            switch (completion.operation) {
+                .cancel => |op| {
+                    sqe.prep_cancel(@intFromPtr(op.target), 0);
+                },
+                .accept => |*op| {
+                    sqe.prep_accept(
+                        op.socket,
+                        &op.address,
+                        &op.address_size,
+                        posix.SOCK.CLOEXEC,
+                    );
+                },
+                .close => |op| {
+                    sqe.prep_close(op.fd);
+                },
+                .connect => |*op| {
+                    sqe.prep_connect(
+                        op.socket,
+                        &op.address.any,
+                        op.address.getOsSockLen(),
+                    );
+                },
+                .fsync => |op| {
+                    sqe.prep_fsync(op.fd, op.flags);
+                },
+                .openat => |op| {
+                    sqe.prep_openat(
+                        op.dir_fd,
+                        op.file_path,
+                        op.flags,
+                        op.mode,
+                    );
+                },
+                .read => |op| {
+                    sqe.prep_read(
+                        op.fd,
+                        op.buffer[0..buffer_limit(op.buffer.len)],
+                        op.offset,
+                    );
+                },
+                .recv => |op| {
+                    sqe.prep_recv(op.socket, op.buffer, 0);
+                },
+                .send => |op| {
+                    sqe.prep_send(op.socket, op.buffer, posix.MSG.NOSIGNAL);
+                },
+                .statx => |op| {
+                    sqe.prep_statx(
+                        op.dir_fd,
+                        op.file_path,
+                        op.flags,
+                        op.mask,
+                        op.statxbuf,
+                    );
+                },
+                .timeout => |*op| {
+                    sqe.prep_timeout(&op.timespec, 0, 0);
+                },
+                .write => |op| {
+                    sqe.prep_write(
+                        op.fd,
+                        op.buffer[0..buffer_limit(op.buffer.len)],
+                        op.offset,
+                    );
+                },
+            }
+            sqe.user_data = @intFromPtr(completion);
+        }
+
+        fn complete(completion: *Completion) void {
+            switch (completion.operation) {
+                .cancel => {
+                    const result: CancelError!void = result: {
+                        if (completion.result < 0) {
+                            break :result switch (@as(posix.E, @enumFromInt(-completion.result))) {
+                                // No operation matching the completion is queued, so there is
+                                // nothing to cancel.
+                                .NOENT => error.NotRunning,
+                                // The operation as far enough along that it cannot be canceled.
+                                // It should complete soon.
+                                .ALREADY => error.NotInterruptable,
+                                // SQE is invalid.
+                                .INVAL => unreachable,
+                                else => error.Unexpected,
+                                // else => |errno| {
+                                //     log.err("unexpected errno: cancel: code={d} name={?s}", .{
+                                //         @intFromEnum(errno),
+                                //         std.enums.tagName(std.posix.system.E, errno),
+                                //     });
+                                //     error.Unexpected
+                                // },
+                            };
+                        }
+                    };
+                    completion.callback(completion.context, completion, &result);
+                },
+                .accept => {
+                    const result: AcceptError!socket_t = blk: {
+                        if (completion.result < 0) {
+                            const err = switch (@as(posix.E, @enumFromInt(-completion.result))) {
+                                .INTR => {
+                                    completion.io.enqueue(completion);
+                                    return;
+                                },
+                                .AGAIN => error.WouldBlock,
+                                .BADF => error.FileDescriptorInvalid,
+                                .CONNABORTED => error.ConnectionAborted,
+                                .FAULT => unreachable,
+                                .INVAL => error.SocketNotListening,
+                                .MFILE => error.ProcessFdQuotaExceeded,
+                                .NFILE => error.SystemFdQuotaExceeded,
+                                .NOBUFS => error.SystemResources,
+                                .NOMEM => error.SystemResources,
+                                .NOTSOCK => error.FileDescriptorNotASocket,
+                                .OPNOTSUPP => error.OperationNotSupported,
+                                .PERM => error.PermissionDenied,
+                                .PROTO => error.ProtocolFailure,
+                                else => error.Unexpected,
+                                // else => |errno| {
+                                //     log.err("unexpected errno: accept: code={d} name={?s}", .{
+                                //         @intFromEnum(errno),
+                                //         std.enums.tagName(std.posix.system.E, errno),
+                                //     });
+                                //     error.Unexpected;
+                                // },
+                            };
+                            break :blk err;
+                        } else {
+                            break :blk @intCast(completion.result);
+                        }
+                    };
+                    completion.callback(completion.context, completion, &result);
+                },
+                .close => {
+                    const result: CloseError!void = blk: {
+                        if (completion.result < 0) {
+                            const err = switch (@as(posix.E, @enumFromInt(-completion.result))) {
+                                // A success, see https://github.com/ziglang/zig/issues/2425.
+                                .INTR => {},
+                                .BADF => error.FileDescriptorInvalid,
+                                .DQUOT => error.DiskQuota,
+                                .IO => error.InputOutput,
+                                .NOSPC => error.NoSpaceLeft,
+                                else => error.Unexpected,
+                                // else => |errno| {
+                                //     log.err("unexpected errno: close: code={d} name={?s}", .{
+                                //         @intFromEnum(errno),
+                                //         std.enums.tagName(std.posix.system.E, errno),
+                                //     });
+                                //     return error.Unexpected;
+                                // },
+                            };
+                            break :blk err;
+                        } else {
+                            assert(completion.result == 0);
+                        }
+                    };
+                    completion.callback(completion.context, completion, &result);
+                },
+                .connect => {
+                    const result: ConnectError!void = blk: {
+                        if (completion.result < 0) {
+                            const err = switch (@as(posix.E, @enumFromInt(-completion.result))) {
+                                .INTR => {
+                                    completion.io.enqueue(completion);
+                                    return;
+                                },
+                                .ACCES => error.AccessDenied,
+                                .ADDRINUSE => error.AddressInUse,
+                                .ADDRNOTAVAIL => error.AddressNotAvailable,
+                                .AFNOSUPPORT => error.AddressFamilyNotSupported,
+                                .AGAIN, .INPROGRESS => error.WouldBlock,
+                                .ALREADY => error.OpenAlreadyInProgress,
+                                .BADF => error.FileDescriptorInvalid,
+                                .CANCELED => error.Canceled,
+                                .CONNREFUSED => error.ConnectionRefused,
+                                .CONNRESET => error.ConnectionResetByPeer,
+                                .FAULT => unreachable,
+                                .ISCONN => error.AlreadyConnected,
+                                .NETUNREACH => error.NetworkUnreachable,
+                                .HOSTUNREACH => error.HostUnreachable,
+                                .NOENT => error.FileNotFound,
+                                .NOTSOCK => error.FileDescriptorNotASocket,
+                                .PERM => error.PermissionDenied,
+                                .PROTOTYPE => error.ProtocolNotSupported,
+                                .TIMEDOUT => error.ConnectionTimedOut,
+                                else => error.Unexpected,
+                                // else => |errno| {
+                                //     log.err("unexpected errno: connect: code={d} name={?s}", .{
+                                //         @intFromEnum(errno),
+                                //         std.enums.tagName(std.posix.system.E, errno),
+                                //     });
+                                //     error.Unexpected;
+                                // },
+                            };
+                            break :blk err;
+                        } else {
+                            assert(completion.result == 0);
+                        }
+                    };
+                    completion.callback(completion.context, completion, &result);
+                },
+                .fsync => {
+                    const result: anyerror!void = blk: {
+                        if (completion.result < 0) {
+                            const err = switch (@as(posix.E, @enumFromInt(-completion.result))) {
+                                .INTR => {
+                                    completion.io.enqueue(completion);
+                                    return;
+                                },
+                                .BADF => error.FileDescriptorInvalid,
+                                .IO => error.InputOutput,
+                                .INVAL => unreachable,
+                                else => error.Unexpected,
+                                // else => |errno| {
+                                //     log.err("unexpected errno: fsync: code={d} name={?s}", .{
+                                //         @intFromEnum(errno),
+                                //         std.enums.tagName(std.posix.system.E, errno),
+                                //     });
+                                //     error.Unexpected;
+                                // },
+                            };
+                            break :blk err;
+                        } else {
+                            assert(completion.result == 0);
+                        }
+                    };
+                    completion.callback(completion.context, completion, &result);
+                },
+                .openat => {
+                    const result: OpenatError!fd_t = blk: {
+                        if (completion.result < 0) {
+                            const err = switch (@as(posix.E, @enumFromInt(-completion.result))) {
+                                .INTR => {
+                                    completion.io.enqueue(completion);
+                                    return;
+                                },
+                                .FAULT => unreachable,
+                                .INVAL => unreachable,
+                                .BADF => unreachable,
+                                .ACCES => error.AccessDenied,
+                                .FBIG => error.FileTooBig,
+                                .OVERFLOW => error.FileTooBig,
+                                .ISDIR => error.IsDir,
+                                .LOOP => error.SymLinkLoop,
+                                .MFILE => error.ProcessFdQuotaExceeded,
+                                .NAMETOOLONG => error.NameTooLong,
+                                .NFILE => error.SystemFdQuotaExceeded,
+                                .NODEV => error.NoDevice,
+                                .NOENT => error.FileNotFound,
+                                .NOMEM => error.SystemResources,
+                                .NOSPC => error.NoSpaceLeft,
+                                .NOTDIR => error.NotDir,
+                                .PERM => error.AccessDenied,
+                                .EXIST => error.PathAlreadyExists,
+                                .BUSY => error.DeviceBusy,
+                                .OPNOTSUPP => error.FileLocksNotSupported,
+                                .AGAIN => error.WouldBlock,
+                                .TXTBSY => error.FileBusy,
+                                else => error.Unexpected,
+                                // else => |errno| {
+                                //     log.err("unexpected errno: openat: code={d} name={?s}", .{
+                                //         @intFromEnum(errno),
+                                //         std.enums.tagName(std.posix.system.E, errno),
+                                //     });
+                                //     error.Unexpected;
+                                // },
+                            };
+                            break :blk err;
+                        } else {
+                            break :blk @intCast(completion.result);
+                        }
+                    };
+                    completion.callback(completion.context, completion, &result);
+                },
+                .read => {
+                    const result: ReadError!usize = blk: {
+                        if (completion.result < 0) {
+                            const err = switch (@as(posix.E, @enumFromInt(-completion.result))) {
+                                .INTR, .AGAIN => {
+                                    // Some file systems, like XFS, can return EAGAIN even when
+                                    // reading from a blocking file without flags like RWF_NOWAIT.
+                                    completion.io.enqueue(completion);
+                                    return;
+                                },
+                                .BADF => error.NotOpenForReading,
+                                .CONNRESET => error.ConnectionResetByPeer,
+                                .FAULT => unreachable,
+                                .INVAL => error.Alignment,
+                                .IO => error.InputOutput,
+                                .ISDIR => error.IsDir,
+                                .NOBUFS => error.SystemResources,
+                                .NOMEM => error.SystemResources,
+                                .NXIO => error.Unseekable,
+                                .OVERFLOW => error.Unseekable,
+                                .SPIPE => error.Unseekable,
+                                .TIMEDOUT => error.ConnectionTimedOut,
+                                else => error.Unexpected,
+                                // else => |errno| {
+                                //     log.err("unexpected errno: read: code={d} name={?s}", .{
+                                //         @intFromEnum(errno),
+                                //         std.enums.tagName(std.posix.system.E, errno),
+                                //     });
+                                //     error.Unexpected;
+                                // },
+                            };
+                            break :blk err;
+                        } else {
+                            break :blk @intCast(completion.result);
+                        }
+                    };
+                    completion.callback(completion.context, completion, &result);
+                },
+                .recv => {
+                    const result: RecvError!usize = blk: {
+                        if (completion.result < 0) {
+                            const err = switch (@as(posix.E, @enumFromInt(-completion.result))) {
+                                .INTR => {
+                                    completion.io.enqueue(completion);
+                                    return;
+                                },
+                                .AGAIN => error.WouldBlock,
+                                .BADF => error.FileDescriptorInvalid,
+                                .CANCELED => error.Canceled,
+                                .CONNREFUSED => error.ConnectionRefused,
+                                .FAULT => unreachable,
+                                .INVAL => unreachable,
+                                .NOMEM => error.SystemResources,
+                                .NOTCONN => error.SocketNotConnected,
+                                .NOTSOCK => error.FileDescriptorNotASocket,
+                                .CONNRESET => error.ConnectionResetByPeer,
+                                .TIMEDOUT => error.ConnectionTimedOut,
+                                .OPNOTSUPP => error.OperationNotSupported,
+                                else => error.Unexpected,
+                                // else => |errno| {
+                                //     log.err("unexpected errno: recv: code={d} name={?s}", .{
+                                //         @intFromEnum(errno),
+                                //         std.enums.tagName(std.posix.system.E, errno),
+                                //     });
+                                //     error.Unexpected;
+                                // },
+                            };
+                            break :blk err;
+                        } else {
+                            break :blk @intCast(completion.result);
+                        }
+                    };
+                    completion.callback(completion.context, completion, &result);
+                },
+                .send => {
+                    const result: SendError!usize = blk: {
+                        if (completion.result < 0) {
+                            const err = switch (@as(posix.E, @enumFromInt(-completion.result))) {
+                                .INTR => {
+                                    completion.io.enqueue(completion);
+                                    return;
+                                },
+                                .ACCES => error.AccessDenied,
+                                .AGAIN => error.WouldBlock,
+                                .ALREADY => error.FastOpenAlreadyInProgress,
+                                .AFNOSUPPORT => error.AddressFamilyNotSupported,
+                                .BADF => error.FileDescriptorInvalid,
+                                // Can happen when send()'ing to a UDP socket.
+                                .CONNREFUSED => error.ConnectionRefused,
+                                .CONNRESET => error.ConnectionResetByPeer,
+                                .DESTADDRREQ => unreachable,
+                                .FAULT => unreachable,
+                                .INVAL => unreachable,
+                                .ISCONN => unreachable,
+                                .MSGSIZE => error.MessageTooBig,
+                                .NOBUFS => error.SystemResources,
+                                .NOMEM => error.SystemResources,
+                                .NOTCONN => error.SocketNotConnected,
+                                .NOTSOCK => error.FileDescriptorNotASocket,
+                                .OPNOTSUPP => error.OperationNotSupported,
+                                .PIPE => error.BrokenPipe,
+                                .TIMEDOUT => error.ConnectionTimedOut,
+                                .CANCELED => error.Canceled,
+                                else => error.Unexpected,
+                                // else => |errno| {
+                                //     log.err("unexpected errno: send: code={d} name={?s}", .{
+                                //         @intFromEnum(errno),
+                                //         std.enums.tagName(std.posix.system.E, errno),
+                                //     });
+                                //     error.Unexpected;
+                                // },
+                            };
+                            break :blk err;
+                        } else {
+                            break :blk @intCast(completion.result);
+                        }
+                    };
+                    completion.callback(completion.context, completion, &result);
+                },
+                .statx => {
+                    const result: StatxError!void = blk: {
+                        if (completion.result < 0) {
+                            const err = switch (@as(posix.E, @enumFromInt(-completion.result))) {
+                                .INTR => {
+                                    completion.io.enqueue(completion);
+                                    return;
+                                },
+                                .FAULT => unreachable,
+                                .INVAL => unreachable,
+                                .BADF => unreachable,
+                                .ACCES => error.AccessDenied,
+                                .LOOP => error.SymLinkLoop,
+                                .NAMETOOLONG => error.NameTooLong,
+                                .NOENT => error.FileNotFound,
+                                .NOMEM => error.SystemResources,
+                                .NOTDIR => error.NotDir,
+                                else => error.Unexpected,
+                                // else => |errno| {
+                                //     log.err("unexpected errno: statx: code={d} name={?s}", .{
+                                //         @intFromEnum(errno),
+                                //         std.enums.tagName(std.posix.system.E, errno),
+                                //     });
+                                //     error.Unexpected;
+                                // },
+                            };
+                            break :blk err;
+                        } else {
+                            assert(completion.result == 0);
+                        }
+                    };
+                    completion.callback(completion.context, completion, &result);
+                },
+                .timeout => {
+                    assert(completion.result < 0);
+                    const err = switch (@as(posix.E, @enumFromInt(-completion.result))) {
+                        .INTR => {
+                            completion.io.enqueue(completion);
+                            return;
+                        },
+                        .CANCELED => error.Canceled,
+                        .TIME => {}, // A success.
+                        else => error.Unexpected,
+                        // else => |errno| {
+                        //     log.err("unexpected errno: timeout: code={d} name={?s}", .{
+                        //         @intFromEnum(errno),
+                        //         std.enums.tagName(std.posix.system.E, errno),
+                        //     });
+                        //     error.Unexpected;
+                        // },
+                    };
+                    const result: TimeoutError!void = err;
+                    completion.callback(completion.context, completion, &result);
+                },
+                .write => {
+                    const result: WriteError!usize = blk: {
+                        if (completion.result < 0) {
+                            const err = switch (@as(posix.E, @enumFromInt(-completion.result))) {
+                                .INTR => {
+                                    completion.io.enqueue(completion);
+                                    return;
+                                },
+                                .AGAIN => error.WouldBlock,
+                                .BADF => error.NotOpenForWriting,
+                                .DESTADDRREQ => error.NotConnected,
+                                .DQUOT => error.DiskQuota,
+                                .FAULT => unreachable,
+                                .FBIG => error.FileTooBig,
+                                .INVAL => error.Alignment,
+                                .IO => error.InputOutput,
+                                .NOSPC => error.NoSpaceLeft,
+                                .NXIO => error.Unseekable,
+                                .OVERFLOW => error.Unseekable,
+                                .PERM => error.AccessDenied,
+                                .PIPE => error.BrokenPipe,
+                                .SPIPE => error.Unseekable,
+                                else => error.Unexpected,
+                                // else => |errno| {
+                                //     log.err("unexpected errno: write: code={d} name={?s}", .{
+                                //         @intFromEnum(errno),
+                                //         std.enums.tagName(std.posix.system.E, errno),
+                                //     });
+                                //     error.Unexpected;
+                                // },
+                            };
+                            break :blk err;
+                        } else {
+                            break :blk @intCast(completion.result);
+                        }
+                    };
+                    completion.callback(completion.context, completion, &result);
+                },
+            }
+        }
+    };
+
+    /// This union encodes the set of operations supported as well as their arguments.
+    const Operation = union(enum) {
+        cancel: struct {
+            target: *Completion,
+        },
+        accept: struct {
+            socket: socket_t,
+            address: posix.sockaddr = undefined,
+            address_size: posix.socklen_t = @sizeOf(posix.sockaddr),
+        },
+        close: struct {
+            fd: fd_t,
+        },
+        connect: struct {
+            socket: socket_t,
+            address: std.net.Address,
+        },
+        fsync: struct {
+            fd: fd_t,
+            flags: u32,
+        },
+        openat: struct {
+            dir_fd: fd_t,
+            file_path: [*:0]const u8,
+            flags: posix.O,
+            mode: posix.mode_t,
+        },
+        read: struct {
+            fd: fd_t,
+            buffer: []u8,
+            offset: u64,
+        },
+        recv: struct {
+            socket: socket_t,
+            buffer: []u8,
+        },
+        send: struct {
+            socket: socket_t,
+            buffer: []const u8,
+        },
+        statx: struct {
+            dir_fd: fd_t,
+            file_path: [*:0]const u8,
+            flags: u32,
+            mask: u32,
+            statxbuf: *std.os.linux.Statx,
+        },
+        timeout: struct {
+            timespec: os.linux.kernel_timespec,
+        },
+        write: struct {
+            fd: fd_t,
+            buffer: []const u8,
+            offset: u64,
+        },
+    };
+
+    pub const AcceptError = error{
+        WouldBlock,
+        FileDescriptorInvalid,
+        ConnectionAborted,
+        SocketNotListening,
+        ProcessFdQuotaExceeded,
+        SystemFdQuotaExceeded,
+        SystemResources,
+        FileDescriptorNotASocket,
+        OperationNotSupported,
+        PermissionDenied,
+        ProtocolFailure,
+    } || posix.UnexpectedError;
+
+    pub fn accept(
+        self: *IO,
+        comptime Context: type,
+        context: Context,
+        comptime callback: fn (
+            context: Context,
+            completion: *Completion,
+            result: AcceptError!socket_t,
+        ) void,
+        completion: *Completion,
+        socket: socket_t,
+    ) void {
+        completion.* = .{
+            .io = self,
+            .context = context,
+            .callback = erase_types(Context, AcceptError!socket_t, callback),
+            .operation = .{
+                .accept = .{
+                    .socket = socket,
+                    .address = undefined,
+                    .address_size = @sizeOf(posix.sockaddr),
+                },
+            },
+        };
+        self.enqueue(completion);
+    }
+
+    pub const CloseError = error{
+        FileDescriptorInvalid,
+        DiskQuota,
+        InputOutput,
+        NoSpaceLeft,
+    } || posix.UnexpectedError;
+
+    pub fn close(
+        self: *IO,
+        comptime Context: type,
+        context: Context,
+        comptime callback: fn (
+            context: Context,
+            completion: *Completion,
+            result: CloseError!void,
+        ) void,
+        completion: *Completion,
+        fd: fd_t,
+    ) void {
+        completion.* = .{
+            .io = self,
+            .context = context,
+            .callback = erase_types(Context, CloseError!void, callback),
+            .operation = .{
+                .close = .{ .fd = fd },
+            },
+        };
+        self.enqueue(completion);
+    }
+
+    pub const ConnectError = error{
+        AccessDenied,
+        AddressInUse,
+        AddressNotAvailable,
+        AddressFamilyNotSupported,
+        WouldBlock,
+        OpenAlreadyInProgress,
+        FileDescriptorInvalid,
+        ConnectionRefused,
+        ConnectionResetByPeer,
+        AlreadyConnected,
+        NetworkUnreachable,
+        HostUnreachable,
+        FileNotFound,
+        FileDescriptorNotASocket,
+        PermissionDenied,
+        ProtocolNotSupported,
+        ConnectionTimedOut,
+        SystemResources,
+        Canceled,
+    } || posix.UnexpectedError;
+
+    pub fn connect(
+        self: *IO,
+        comptime Context: type,
+        context: Context,
+        comptime callback: fn (
+            context: Context,
+            completion: *Completion,
+            result: ConnectError!void,
+        ) void,
+        completion: *Completion,
+        socket: socket_t,
+        address: std.net.Address,
+    ) void {
+        completion.* = .{
+            .io = self,
+            .context = context,
+            .callback = erase_types(Context, ConnectError!void, callback),
+            .operation = .{
+                .connect = .{
+                    .socket = socket,
+                    .address = address,
+                },
+            },
+        };
+        self.enqueue(completion);
+    }
+
+    pub const FsyncError = error{
+        FileDescriptorInvalid,
+        InputOutput,
+    } || posix.UnexpectedError;
+
+    pub fn fsync(
+        self: *IO,
+        comptime Context: type,
+        context: Context,
+        comptime callback: fn (
+            context: Context,
+            completion: *Completion,
+            result: FsyncError!void,
+        ) void,
+        completion: *Completion,
+        fd: fd_t,
+    ) void {
+        completion.* = .{
+            .io = self,
+            .context = context,
+            .callback = erase_types(Context, FsyncError!void, callback),
+            .operation = .{
+                .fsync = .{
+                    .fd = fd,
+                    .flags = os.linux.IORING_FSYNC_DATASYNC,
+                },
+            },
+        };
+        self.enqueue(completion);
+    }
+
+    pub const OpenatError = posix.OpenError || posix.UnexpectedError;
+
+    pub fn openat(
+        self: *IO,
+        comptime Context: type,
+        context: Context,
+        comptime callback: fn (
+            context: Context,
+            completion: *Completion,
+            result: OpenatError!fd_t,
+        ) void,
+        completion: *Completion,
+        dir_fd: fd_t,
+        file_path: [*:0]const u8,
+        flags: posix.O,
+        mode: posix.mode_t,
+    ) void {
+        var new_flags = flags;
+        new_flags.CLOEXEC = true;
+
+        completion.* = .{
+            .io = self,
+            .context = context,
+            .callback = erase_types(Context, OpenatError!fd_t, callback),
+            .operation = .{
+                .openat = .{
+                    .dir_fd = dir_fd,
+                    .file_path = file_path,
+                    .flags = new_flags,
+                    .mode = mode,
+                },
+            },
+        };
+        self.enqueue(completion);
+    }
+
+    pub const ReadError = error{
+        WouldBlock,
+        NotOpenForReading,
+        ConnectionResetByPeer,
+        Alignment,
+        InputOutput,
+        IsDir,
+        SystemResources,
+        Unseekable,
+        ConnectionTimedOut,
+    } || posix.UnexpectedError;
+
+    pub fn read(
+        self: *IO,
+        comptime Context: type,
+        context: Context,
+        comptime callback: fn (
+            context: Context,
+            completion: *Completion,
+            result: ReadError!usize,
+        ) void,
+        completion: *Completion,
+        fd: fd_t,
+        buffer: []u8,
+        offset: u64,
+    ) void {
+        completion.* = .{
+            .io = self,
+            .context = context,
+            .callback = erase_types(Context, ReadError!usize, callback),
+            .operation = .{
+                .read = .{
+                    .fd = fd,
+                    .buffer = buffer,
+                    .offset = offset,
+                },
+            },
+        };
+        self.enqueue(completion);
+    }
+
+    pub const RecvError = error{
+        WouldBlock,
+        FileDescriptorInvalid,
+        ConnectionRefused,
+        SystemResources,
+        SocketNotConnected,
+        FileDescriptorNotASocket,
+        ConnectionResetByPeer,
+        ConnectionTimedOut,
+        OperationNotSupported,
+        Canceled,
+    } || posix.UnexpectedError;
+
+    pub fn recv(
+        self: *IO,
+        comptime Context: type,
+        context: Context,
+        comptime callback: fn (
+            context: Context,
+            completion: *Completion,
+            result: RecvError!usize,
+        ) void,
+        completion: *Completion,
+        socket: socket_t,
+        buffer: []u8,
+    ) void {
+        completion.* = .{
+            .io = self,
+            .context = context,
+            .callback = erase_types(Context, RecvError!usize, callback),
+            .operation = .{
+                .recv = .{
+                    .socket = socket,
+                    .buffer = buffer,
+                },
+            },
+        };
+        self.enqueue(completion);
+    }
+
+    pub const SendError = error{
+        AccessDenied,
+        WouldBlock,
+        FastOpenAlreadyInProgress,
+        AddressFamilyNotSupported,
+        FileDescriptorInvalid,
+        ConnectionResetByPeer,
+        MessageTooBig,
+        SystemResources,
+        SocketNotConnected,
+        FileDescriptorNotASocket,
+        OperationNotSupported,
+        BrokenPipe,
+        ConnectionTimedOut,
+        ConnectionRefused,
+        Canceled,
+    } || posix.UnexpectedError;
+
+    pub fn send(
+        self: *IO,
+        comptime Context: type,
+        context: Context,
+        comptime callback: fn (
+            context: Context,
+            completion: *Completion,
+            result: SendError!usize,
+        ) void,
+        completion: *Completion,
+        socket: socket_t,
+        buffer: []const u8,
+    ) void {
+        completion.* = .{
+            .io = self,
+            .context = context,
+            .callback = erase_types(Context, SendError!usize, callback),
+            .operation = .{
+                .send = .{
+                    .socket = socket,
+                    .buffer = buffer,
+                },
+            },
+        };
+        self.enqueue(completion);
+    }
+
+    /// Best effort to synchronously transfer bytes to the kernel.
+    pub fn send_now(self: *IO, socket: socket_t, buffer: []const u8) ?usize {
+        _ = self;
+        // posix.send is a thin wrapper around posix.sendto() that assumes the socket is connected
+        // and has an `unreachable` on eg NetworkUnreachable and a few others. Tring to check this
+        // before using the socket is race prone, so rather use sendto() directly to correctly
+        // handle those cases.
+        return posix.sendto(
+            socket,
+            buffer,
+            posix.MSG.DONTWAIT | posix.MSG.NOSIGNAL,
+            null,
+            0,
+        ) catch |err| switch (err) {
+            error.WouldBlock => return null,
+            // To avoid duplicating error handling, force the caller to fallback to normal send.
+            else => return null,
+        };
+    }
+
+    pub const StatxError = error{
+        SymLinkLoop,
+        FileNotFound,
+        NameTooLong,
+        NotDir,
+    } || std.fs.File.StatError || posix.UnexpectedError;
+
+    pub fn statx(
+        self: *IO,
+        comptime Context: type,
+        context: Context,
+        comptime callback: fn (
+            context: Context,
+            completion: *Completion,
+            result: StatxError!void,
+        ) void,
+        completion: *Completion,
+        dir_fd: fd_t,
+        file_path: [*:0]const u8,
+        flags: u32,
+        mask: u32,
+        statxbuf: *std.os.linux.Statx,
+    ) void {
+        completion.* = .{
+            .io = self,
+            .context = context,
+            .callback = erase_types(Context, StatxError!void, callback),
+            .operation = .{
+                .statx = .{
+                    .dir_fd = dir_fd,
+                    .file_path = file_path,
+                    .flags = flags,
+                    .mask = mask,
+                    .statxbuf = statxbuf,
+                },
+            },
+        };
+        self.enqueue(completion);
+    }
+
+    pub const TimeoutError = error{Canceled} || posix.UnexpectedError;
+
+    pub fn timeout(
+        self: *IO,
+        comptime Context: type,
+        context: Context,
+        comptime callback: fn (
+            context: Context,
+            completion: *Completion,
+            result: TimeoutError!void,
+        ) void,
+        completion: *Completion,
+        nanoseconds: u63,
+    ) void {
+        completion.* = .{
+            .io = self,
+            .context = context,
+            .callback = erase_types(Context, TimeoutError!void, callback),
+            .operation = .{
+                .timeout = .{
+                    .timespec = .{ .sec = 0, .nsec = nanoseconds },
+                },
+            },
+        };
+
+        // Special case a zero timeout as a yield.
+        if (nanoseconds == 0) {
+            completion.result = -@as(i32, @intFromEnum(posix.E.TIME));
+            self.completed.push(completion);
+            return;
+        }
+
+        self.enqueue(completion);
+    }
+
+    pub const WriteError = error{
+        WouldBlock,
+        NotOpenForWriting,
+        NotConnected,
+        DiskQuota,
+        FileTooBig,
+        Alignment,
+        InputOutput,
+        NoSpaceLeft,
+        Unseekable,
+        AccessDenied,
+        BrokenPipe,
+    } || posix.UnexpectedError;
+
+    pub fn write(
+        self: *IO,
+        comptime Context: type,
+        context: Context,
+        comptime callback: fn (
+            context: Context,
+            completion: *Completion,
+            result: WriteError!usize,
+        ) void,
+        completion: *Completion,
+        fd: fd_t,
+        buffer: []const u8,
+        offset: u64,
+    ) void {
+        completion.* = .{
+            .io = self,
+            .context = context,
+            .callback = erase_types(Context, WriteError!usize, callback),
+            .operation = .{
+                .write = .{
+                    .fd = fd,
+                    .buffer = buffer,
+                    .offset = offset,
+                },
+            },
+        };
+        self.enqueue(completion);
+    }
+
+    pub const Event = posix.fd_t;
+    pub const INVALID_EVENT: Event = -1;
+
+    pub fn open_event(self: *IO) !Event {
+        _ = self;
+
+        // eventfd initialized with no (zero) previous write value.
+        const event_fd = posix.eventfd(0, linux.EFD.CLOEXEC) catch |err| switch (err) {
+            error.SystemResources,
+            error.SystemFdQuotaExceeded,
+            error.ProcessFdQuotaExceeded,
+            => return error.SystemResources,
+            error.Unexpected => return error.Unexpected,
+        };
+        assert(event_fd != INVALID_EVENT);
+        errdefer os.close(event_fd);
+
+        return event_fd;
+    }
+
+    pub fn event_listen(
+        self: *IO,
+        event: Event,
+        completion: *Completion,
+        comptime on_event: fn (*Completion) void,
+    ) void {
+        assert(event != INVALID_EVENT);
+        const Context = struct {
+            const Context = @This();
+            var buffer: u64 = undefined;
+
+            fn on_read(
+                _: *Context,
+                completion_inner: *Completion,
+                result: ReadError!usize,
+            ) void {
+                const bytes = result catch unreachable; // eventfd reads should not fail.
+                assert(bytes == @sizeOf(u64));
+                on_event(completion_inner);
+            }
+        };
+
+        self.read(
+            *Context,
+            undefined,
+            Context.on_read,
+            completion,
+            event,
+            std.mem.asBytes(&Context.buffer),
+            0, // eventfd reads must always start from 0 offset.
+        );
+    }
+
+    pub fn event_trigger(self: *IO, event: Event, completion: *Completion) void {
+        assert(event != INVALID_EVENT);
+        _ = self;
+        _ = completion;
+
+        const value: u64 = 1;
+        const bytes = posix.write(event, std.mem.asBytes(&value)) catch unreachable;
+        assert(bytes == @sizeOf(u64));
+    }
+
+    pub fn close_event(self: *IO, event: Event) void {
+        assert(event != INVALID_EVENT);
+        _ = self;
+
+        posix.close(event);
+    }
+
+    pub const socket_t = posix.socket_t;
+
+    /// Creates a TCP socket that can be used for async operations with the IO instance.
+    pub fn open_socket_tcp(self: *IO, family: u32, options: TCPOptions) !socket_t {
+        const fd = try posix.socket(
+            family,
+            posix.SOCK.STREAM | posix.SOCK.CLOEXEC,
+            posix.IPPROTO.TCP,
+        );
+        errdefer self.close_socket(fd);
+
+        try common.tcp_options(fd, options);
+        return fd;
+    }
+
+    /// Creates a UDP socket that can be used for async operations with the IO instance.
+    pub fn open_socket_udp(self: *IO, family: u32) !socket_t {
+        _ = self;
+        return try posix.socket(
+            family,
+            std.posix.SOCK.DGRAM | posix.SOCK.CLOEXEC,
+            posix.IPPROTO.UDP,
+        );
+    }
+
+    /// Closes a socket opened by the IO instance.
+    pub fn close_socket(self: *IO, socket: socket_t) void {
+        _ = self;
+        posix.close(socket);
+    }
+
+    /// Listen on the given TCP socket.
+    /// Returns socket resolved address, which might be more specific
+    /// than the input address (e.g., listening on port 0).
+    pub fn listen(
+        _: *IO,
+        fd: socket_t,
+        address: std.net.Address,
+        options: ListenOptions,
+    ) !std.net.Address {
+        return common.listen(fd, address, options);
+    }
+
+    pub fn shutdown(_: *IO, socket: socket_t, how: posix.ShutdownHow) posix.ShutdownError!void {
+        return posix.shutdown(socket, how);
+    }
+
+    /// Opens a directory with read only access.
+    pub fn open_dir(dir_path: []const u8) !fd_t {
+        return posix.open(dir_path, .{ .CLOEXEC = true, .ACCMODE = .RDONLY }, 0);
+    }
+
+    pub const fd_t = posix.fd_t;
+    pub const INVALID_FILE: fd_t = -1;
+
+    pub const PReadError = posix.PReadError;
+
+    fn erase_types(
+        comptime Context: type,
+        comptime Result: type,
+        comptime callback: fn (
+            context: Context,
+            completion: *Completion,
+            result: Result,
+        ) void,
+    ) *const fn (?*anyopaque, *Completion, *const anyopaque) void {
+        return &struct {
+            fn erased(
+                ctx_any: ?*anyopaque,
+                completion: *Completion,
+                result_any: *const anyopaque,
+            ) void {
+                const ctx: Context = @ptrCast(@alignCast(ctx_any));
+                const result: *const Result = @ptrCast(@alignCast(result_any));
+                callback(ctx, completion, result.*);
+            }
+        }.erased;
+    }
+};
+
+/// `maybe` is the dual of `assert`: it signals that condition is sometimes true
+///  and sometimes false.
+///
+/// Currently we use it for documentation, but maybe one day we plug it into
+/// coverage.
+pub fn maybe(ok: bool) void {
+    assert(ok or !ok);
+}
+
+// std.SemanticVersion requires there be no extra characters after the
+// major/minor/patch numbers. But when we try to parse `uname
+// --kernel-release` (note: while Linux doesn't follow semantic
+// versioning, it doesn't violate it either), some distributions have
+// extra characters, such as this Fedora one: 6.3.8-100.fc37.x86_64, and
+// this WSL one has more than three dots:
+// 5.15.90.1-microsoft-standard-WSL2.
+pub fn parse_dirty_semver(dirty_release: []const u8) !std.SemanticVersion {
+    const release = blk: {
+        var last_valid_version_character_index: usize = 0;
+        var dots_found: u8 = 0;
+        for (dirty_release) |c| {
+            if (c == '.') dots_found += 1;
+            if (dots_found == 3) {
+                break;
+            }
+
+            if (c == '.' or (c >= '0' and c <= '9')) {
+                last_valid_version_character_index += 1;
+                continue;
+            }
+
+            break;
+        }
+
+        break :blk dirty_release[0..last_valid_version_character_index];
+    };
+
+    return std.SemanticVersion.parse(release);
+}
+
+pub fn buffer_limit(buffer_len: usize) usize {
+    // Linux limits how much may be written in a `pwrite()/pread()` call, which is `0x7ffff000` on
+    // both 64-bit and 32-bit systems, due to using a signed C int as the return value, as well as
+    // stuffing the errno codes into the last `4096` values.
+    // Darwin limits writes to `0x7fffffff` bytes, more than that returns `EINVAL`.
+    // The corresponding POSIX limit is `std.math.maxInt(isize)`.
+    const limit = switch (builtin.target.os.tag) {
+        .linux => 0x7ffff000,
+        .macos, .ios, .watchos, .tvos => std.math.maxInt(i32),
+        else => std.math.maxInt(isize),
+    };
+    return @min(limit, buffer_len);
+}

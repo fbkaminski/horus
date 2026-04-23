@@ -1,0 +1,78 @@
+// ============================================================
+//  ServiceManagerControl
+//  @local_only — never exposed via RPC; node-internal authority
+//  @singleton  — exactly one instance per node, owned by mesh-broker
+// ============================================================
+
+@version(1)
+@local_only
+@singleton
+interface ServiceManagerControl {
+
+    /// Register this process as an implementation of the given interface.
+    /// The service manager will verify the caller's CapToken before accepting.
+    /// On success, returns the ObjectID assigned to this registration.
+    /// The caller must keep its bootstrap connection open; closing it
+    /// implicitly revokes all registrations made on that connection.
+    async fn register(
+        iid:         InterfaceID,
+        capability:  CapToken,
+        flags:       ServiceFlags,
+    ) -> Result<ObjectID, ServiceError>;
+
+    /// Request a Handle to an implementation of the given interface.
+    /// If the service is registered but not running and has @activate_on_demand,
+    /// the manager will spawn it before returning.
+    /// The channel fd is transferred via SCM_RIGHTS on the bootstrap socket;
+    /// the returned ChannelEndpoint identifies which object it connects to.
+    async fn resolve(
+        iid:        InterfaceID,
+        capability: CapToken,
+    ) -> Result<ChannelEndpoint, ServiceError>;
+
+    /// Resolve all available implementations of an interface.
+    /// Useful for @replicated interfaces where the caller may want
+    /// to choose or fan out.
+    async fn resolve_all(
+        iid:        InterfaceID,
+        capability: CapToken,
+    ) -> Result<list<ChannelEndpoint>, ServiceError>;
+
+    /// Explicitly revoke a registration before process exit.
+    /// Sends ServiceEvent.Departed to all watchers.
+    async fn revoke(
+        object_id:  ObjectID,
+        capability: CapToken,
+    ) -> Result<void, ServiceError>;
+
+    /// Subscribe to lifecycle events for a given interface.
+    /// Returns a stream of ServiceEvent until the watcher is dropped.
+    /// Caller receives .Arrived immediately for any currently-live
+    /// implementations, then future events as they happen.
+    stream fn watch(
+        iid:        InterfaceID,
+        capability: CapToken,
+    ) -> ServiceEvent;
+
+    /// List all interface IDs currently registered on this node.
+    /// Intended for introspection and tooling, not hot-path use.
+    async fn list_interfaces(
+        capability: CapToken,
+    ) -> Result<list<ServiceDescriptor>, ServiceError>;
+
+    /// Force-start a service that is registered but not running.
+    /// No-op if already running.
+    async fn spawn(
+        object_id:  ObjectID,
+        capability: CapToken,
+    ) -> Result<void, ServiceError>;
+
+    /// Request graceful shutdown of a running service.
+    /// The service receives a drain signal; after drain_timeout_ms
+    /// it is terminated unconditionally.
+    async fn terminate(
+        object_id:        ObjectID,
+        capability:       CapToken,
+        drain_timeout_ms: u32,
+    ) -> Result<void, ServiceError>;
+}

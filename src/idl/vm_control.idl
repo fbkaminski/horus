@@ -1,0 +1,6 @@
+@version(1)
+@local_only        // Never exposed via RPC; only callable within the same node
+interface VMControl {
+    async fn spawn(image_hash: ContentHash, config: VMConfig) -> Result<VMID, VMError>;
+    async fn terminate(vm_id: VMID) -> Result<(), VMError>;
+}

@@ -1,1 +1,5 @@
 .zig-cache
+zig-out
+kademlia-comparative-analysis.md
+service.md
+src/deprecated

@@ -1,0 +1,67 @@
+// ============================================================
+//  CapabilityBroker
+//  @local_only — capability authority never crosses a node boundary
+//  @singleton  — one broker per node, co-located with mesh-broker
+// ============================================================
+
+@version(1)
+@local_only
+@singleton
+interface CapabilityBroker {
+
+    /// Called internally by mesh-broker at bootstrap connection time.
+    /// Takes the kernel-verified ProcessIdentity from SO_PEERCRED and
+    /// issues a root CapToken for that process.
+    /// Not callable by arbitrary processes — enforced by the service
+    /// manager before dispatch (only the broker's own bootstrap path
+    /// can invoke this method).
+    async fn issue_root(
+        identity: ProcessIdentity,
+    ) -> Result<CapToken, CapError>;
+
+    /// Derive a weaker token from one you already hold.
+    /// The derived token can only express a subset of the rights
+    /// in the parent token — attenuation is enforced structurally,
+    /// not by policy check at call time.
+    ///
+    /// Use this when passing a handle to another service and you
+    /// want to limit what that service can do with it.
+    async fn attenuate(
+        parent:     CapToken,
+        rights:     RightSet,
+    ) -> Result<CapToken, CapError>;
+
+    /// Check whether a token grants a specific right.
+    /// Called by the service manager before every dispatch.
+    /// Synchronous-style semantics — expected to be very fast.
+    async fn validate(
+        token:  CapToken,
+        right:  Right,
+    ) -> Result<bool, CapError>;
+
+    /// Revoke a token and recursively invalidate all tokens
+    /// derived from it. Any service holding a derived token
+    /// will receive CapError.Revoked on next use.
+    async fn revoke(
+        token:      CapToken,
+        authority:  CapToken,   // must be parent of token being revoked
+    ) -> Result<void, CapError>;
+
+    /// Transfer a capability to another process explicitly.
+    /// The recipient process is identified by ObjectID of its
+    /// bootstrap connection — not by PID, which is reusable.
+    /// Returns a new token scoped to the recipient's identity,
+    /// with rights bounded by what the transferer holds.
+    async fn transfer(
+        token:      CapToken,
+        rights:     RightSet,
+        recipient:  ObjectID,
+    ) -> Result<CapToken, CapError>;
+
+    /// Inspect what rights a token carries.
+    /// Intended for debugging and audit tooling.
+    async fn describe(
+        token:      CapToken,
+        authority:  CapToken,   // must have INSPECT right
+    ) -> Result<CapDescriptor, CapError>;
+}

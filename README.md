@@ -1,3 +1,3 @@
-# dht
+# Horus
 
-Kademlia DHT implementation in Zig
+A distributed service and application platform

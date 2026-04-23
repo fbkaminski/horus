@@ -1,0 +1,99 @@
+/// Content-addressed interface identifier — SHA-256 of canonical IDL
+type InterfaceID = bytes[32];
+
+/// Opaque instance identifier, unique within a node
+type ObjectID = u64;
+
+/// Capability token — unforgeable authority token issued by CapabilityBroker
+/// Intentionally opaque to callers; only the broker can decode it
+type CapToken = bytes[64];
+
+/// Process identity as seen by the kernel (from SO_PEERCRED)
+type ProcessIdentity = struct {
+    pid: u32,
+    uid: u32,
+    gid: u32,
+};
+
+/// A node-local endpoint descriptor handed back after introduction
+/// The actual fd is transferred out-of-band via SCM_RIGHTS
+type ChannelEndpoint = struct {
+    object_id:  ObjectID,
+    generation: u32,        // incremented on service restart; stale handle detection
+};
+
+/// Flags supplied at registration time
+type ServiceFlags = bits {
+    ACTIVATE_ON_DEMAND = 0,  // start only when first resolved
+    SINGLETON          = 1,  // at most one instance per node
+    PER_CALLER         = 2,  // separate instance per resolving process
+    EXPORTED           = 3,  // eligible for RPC exposure (requires DHT, future)
+    REPLICATED         = 4,  // mesh may route to any node (requires DHT, future)
+};
+
+type ServiceDescriptor = struct {
+    iid:        InterfaceID,
+    object_id:  ObjectID,
+    owner_pid:  u32,
+    flags:      ServiceFlags,
+    version:    u32,
+};
+
+type ServiceEvent = union {
+    Arrived:   ServiceDescriptor,  // a new implementation became available
+    Departed:  ObjectID,           // an implementation was revoked or crashed
+    Restarted: struct {            // service restarted; generation incremented
+        object_id:      ObjectID,
+        new_generation: u32,
+    },
+};
+
+type ServiceError = enum {
+    NotFound,           // no implementation of this IID is registered
+    PermissionDenied,   // CapToken does not grant access to this IID
+    AlreadyRegistered,  // SINGLETON flag violated
+    InvalidToken,       // CapToken is malformed or revoked
+    SpawnFailed,        // on-demand activation failed
+    Timeout,            // drain timeout exceeded during terminate
+};
+
+/// The set of rights expressible in this capability system
+type Right = enum {
+    // Service manager rights
+    REGISTER_SERVICE,    // may call ServiceManagerControl.register
+    RESOLVE_SERVICE,     // may call ServiceManagerControl.resolve
+    REVOKE_SERVICE,      // may revoke own registrations
+    WATCH_SERVICES,      // may subscribe to ServiceEvent streams
+    SPAWN_SERVICE,       // may force-start an on-demand service
+    TERMINATE_SERVICE,   // may request service shutdown
+    LIST_SERVICES,       // may call list_interfaces (introspection)
+
+    // Capability broker rights
+    ATTENUATE,           // may derive child tokens
+    TRANSFER,            // may delegate capabilities to other processes
+    REVOKE_CHILD,        // may revoke tokens you issued
+    INSPECT,             // may call describe on any token you parent
+
+    // Future: RPC/DHT exposure rights
+    EXPORT_INTERFACE,    // may mark a service @exported
+    REPLICATE_SERVICE,   // may mark a service @replicated
+};
+
+type RightSet = bits<Right>;
+
+type CapDescriptor = struct {
+    rights:     RightSet,
+    owner_pid:  u32,
+    parent_id:  u64,        // 0 if this is a root token
+    issued_at:  u64,        // monotonic timestamp
+    depth:      u32,        // derivation depth from root
+};
+
+type CapError = enum {
+    InvalidToken,       // token is malformed or not known to this broker
+    Revoked,            // token was explicitly revoked
+    InsufficientRights, // token does not carry the requested right
+    AttenuationViolation, // attempted to derive rights not in parent token
+    NotAuthorized,      // authority token does not parent the target token
+    RecipientUnknown,   // transfer target ObjectID not found
+};
