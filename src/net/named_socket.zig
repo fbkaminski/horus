@@ -2,20 +2,33 @@ const std = @import("std");
 const io_linux = @import("../io/linux.zig");
 const IO = io_linux.IO;
 
+const ConnectionState = enum {
+    open,
+    closing,
+    closed,
+};
+
 pub const NamedSocketConnection = struct {
+    allocator: std.mem.Allocator,
     delegate: ?*NamedSocketDelegate,
     io: *IO,
     socket: std.posix.fd_t,
-    closed: bool,
     recv_completion: IO.Completion,
+    cancel_completion: IO.Completion,
+    // FIXME: replace this with an IOBuffer
     buf: [4096]u8,
+    state: ConnectionState,
+    pending_ops: u8,
+    closed_request: bool,
 
-    pub fn init(io: *IO, socket: std.posix.fd_t) NamedSocketConnection {
-        var self: NamedSocketConnection = undefined;
-        self.delegate = undefined;
+    pub fn init(self: *NamedSocketConnection, allocator: std.mem.Allocator, io: *IO, socket: std.posix.fd_t) void {
+        self.allocator = allocator;
+        self.delegate = null;
         self.io = io;
         self.socket = socket;
-        self.closed = false;
+        self.state = .open;
+        self.pending_ops = 0;
+        self.closed_request = false;
         self.recv_completion = .{
             .io = io,
             .operation = .{
@@ -24,14 +37,14 @@ pub const NamedSocketConnection = struct {
                     .buffer = &self.buf,
                 },
             },
-            .context = &self,
+            .context = self,
             .callback = onDataCompletion,
         };
-        return self;
     }
 
     pub fn deinit(self: *NamedSocketConnection) void {
         self.close();
+        self.allocator.destroy(self);
     }
 
     pub fn setDelegate(self: *NamedSocketConnection, delegate: *NamedSocketDelegate) void {
@@ -41,16 +54,43 @@ pub const NamedSocketConnection = struct {
     }
 
     pub fn close(self: *NamedSocketConnection) void {
-        if (!self.closed) {
-            std.posix.close(self.socket);
-            self.closed = true;
-            self.delegate.?.onClose();
-        }
+        if (self.closed_request) return;
+
+        self.closed_request = true;
+        self.state = .closing;
+
+        self.io.cancel(
+            *NamedSocketConnection,
+            self,
+            onCancelComplete,
+            .{
+                .completion = &self.cancel_completion,
+                .target = &self.recv_completion,
+            },
+        );
+        self.pending_ops += 1;
+    }
+
+    fn tryFinalize(self: *NamedSocketConnection) void {
+        if (self.pending_ops != 0) return;
+        if (self.state == .closed) return;
+        self.state = .closed;
+        std.posix.close(self.socket);
+        if (self.delegate) |d| d.onClose();
+    }
+
+    fn onCancelComplete(self: *NamedSocketConnection, _: *IO.Completion, _: IO.CancelError!void) void {
+        self.pending_ops -= 1;
+        self.tryFinalize();
     }
 
     fn onRecv(self: *NamedSocketConnection, _: *IO.Completion, result: IO.RecvError!usize) void {
+        self.pending_ops -= 1;
+        if (self.state == .closing) {
+            self.tryFinalize();
+            return;
+        }
         const n = result catch {
-            std.log.err("NamedProcessChannel onRecv: error casting result to usize", .{});
             self.close();
             return;
         };
@@ -59,7 +99,7 @@ pub const NamedSocketConnection = struct {
             self.close();
             return;
         }
-        self.delegate.?.onRecv(self.buf[0..n]);
+        if (self.delegate) |d| d.onRecv(self.buf[0..n]);
         self.armRecv();
     }
 
@@ -72,6 +112,7 @@ pub const NamedSocketConnection = struct {
             self.socket,
             &self.buf,
         );
+        self.pending_ops += 1;
     }
 
     fn onDataCompletion(ctx: ?*anyopaque, _: *IO.Completion, result: *const anyopaque) void {
@@ -82,6 +123,7 @@ pub const NamedSocketConnection = struct {
 };
 
 pub const NamedServerSocketConnection = struct {
+    allocator: std.mem.Allocator,
     delegate: *NamedServerSocketDelegate,
     io: *IO,
     socket: std.posix.fd_t,
@@ -89,7 +131,7 @@ pub const NamedServerSocketConnection = struct {
     closed: bool,
     accept_completion: IO.Completion,
 
-    pub fn create(delegate: *NamedServerSocketDelegate, io: *IO, path: []const u8) !NamedServerSocketConnection {
+    pub fn create(allocator: std.mem.Allocator, delegate: *NamedServerSocketDelegate, io: *IO, path: []const u8) !NamedServerSocketConnection {
         const socket = try std.posix.socket(
             std.posix.AF.UNIX,
             std.posix.SOCK.STREAM | std.posix.SOCK.NONBLOCK | std.posix.SOCK.CLOEXEC,
@@ -101,6 +143,7 @@ pub const NamedServerSocketConnection = struct {
         std.posix.unlink(path) catch {};
 
         return .{
+            .allocator = allocator,
             .delegate = delegate,
             .io = io,
             .socket = socket,
@@ -149,15 +192,21 @@ pub const NamedServerSocketConnection = struct {
         const client_fd = result catch |err| {
             std.log.err("NamedServerSocketConnection onAccept: failed getting the accepted socket", .{});
             if (err == error.Canceled) return;
-            try self.armAccept();
+            self.armAccept() catch {
+                std.log.err("NamedServerSocketConnection IO.accept: failed to schedule accept", .{});
+                return;
+            };
             return;
         };
-
-        const conn = NamedSocketConnection.init(self.io, client_fd);
+        const conn = self.allocator.create(NamedSocketConnection) catch return;
+        conn.init(self.allocator, self.io, client_fd);
         // the delegate is responsible for the NamedSocketConnection ownership/cleanup
         self.delegate.onAccept(conn);
 
-        try self.armAccept();
+        self.armAccept() catch {
+            std.log.err("NamedServerSocketConnection IO.accept: failed to schedule accept", .{});
+            return;
+        };
     }
 };
 
@@ -185,14 +234,14 @@ pub const NamedServerSocketDelegate = struct {
 
     pub const VTable = struct {
         onClose: *const fn (ptr: *anyopaque) void,
-        onAccept: *const fn (ptr: *anyopaque, socket: NamedSocketConnection) void,
+        onAccept: *const fn (ptr: *anyopaque, socket: *NamedSocketConnection) void,
     };
 
     pub fn onClose(self: NamedServerSocketDelegate) void {
         self.vtable.onClose(self.ptr);
     }
 
-    pub fn onAccept(self: NamedServerSocketDelegate, socket: NamedSocketConnection) void {
+    pub fn onAccept(self: NamedServerSocketDelegate, socket: *NamedSocketConnection) void {
         self.vtable.onAccept(self.ptr, socket);
     }
 };

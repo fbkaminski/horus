@@ -27,7 +27,8 @@ const io_linux = @import("../io/linux.zig");
 const thread_registry_file = @import("../core/thread_registry.zig");
 const work_queue = @import("../core/work_queue.zig");
 const service_file = @import("service.zig");
-const channel_file = @import("../channel/named_process_channel.zig");
+const channel_file = @import("../channel/channel.zig");
+const named_channel_file = @import("../channel/named_process_channel.zig");
 const SingleThreadTaskRunner = thread_file.SingleThreadTaskRunner;
 const IO = io_linux.IO;
 const ThreadRegistry = thread_registry_file.ThreadRegistry;
@@ -38,10 +39,12 @@ const ServiceHandle = service_file.ServiceHandle;
 const ServiceId = service_file.ServiceId;
 const CapToken = service_file.CapToken;
 const InterfaceId = service_file.InterfaceId;
-const NamedProcessChannel = channel_file.NamedProcessChannel;
-const NamedProcessServerChannel = channel_file.NamedProcessServerChannel;
-const ServerChannelDelegate = channel_file.ServerChannelDelegate;
+const Channel = channel_file.Channel;
+const ChannelListener = channel_file.ChannelListener;
+const ChannelListenerDelegate = channel_file.ChannelListenerDelegate;
 const ChannelDelegate = channel_file.ChannelDelegate;
+const NamedProcessChannel = named_channel_file.NamedProcessChannel;
+const NamedProcessServerChannel = named_channel_file.NamedProcessServerChannel;
 
 const SERVICE_MANAGER_SOCKET_PATH: []const u8 = "/tmp/dht_host.sock";
 
@@ -59,7 +62,7 @@ pub const ServiceManager = struct {
     server_channel: NamedProcessServerChannel,
     state: ServiceManagerState,
     clients: ClientContextPool,
-    server_delegate: ServerChannelDelegate,
+    server_delegate: ChannelListenerDelegate,
 
     pub fn init(self: *ServiceManager, allocator: std.mem.Allocator, thread_registry: *ThreadRegistry) !void {
         self.allocator = allocator;
@@ -122,22 +125,20 @@ pub const ServiceManager = struct {
         return self.lastServiceId;
     }
 
-    fn onConnection(self: *ServiceManager, channel: *NamedProcessChannel) void {
+    fn onConnection(self: *ServiceManager, channel: *Channel) void {
         std.debug.assert(self.task_runner.isCurrentThread());
         std.log.info("ServiceManager.onConnection: new client connection", .{});
-        // FIXME: we need to create a context as we may have many connections
-        //        thats an utterly bad desing
-        // add into the pool
+        const named_process_channel: *NamedProcessChannel = @fieldParentPtr("base", channel);
         const client_context = self.allocator.create(ClientContext) catch return;
-        client_context.init(self, &self.task_runner, channel);
-
+        client_context.init(self, &self.task_runner, named_process_channel);
+        // add into the pool
         self.clients.addClient(client_context) catch return;
     }
 
-    fn onServerChannelClosed(self: *ServiceManager, channel: *NamedProcessServerChannel) void {
+    fn onServerChannelClosed(self: *ServiceManager, server: *ChannelListener) void {
         std.log.info("ServiceManager.onServerChannelClosed: server closed the connection", .{});
         _ = self;
-        _ = channel;
+        _ = server;
     }
 
     fn onContextDone(self: *ServiceManager, client_context: *ClientContext) void {
@@ -145,17 +146,18 @@ pub const ServiceManager = struct {
         client_context.deinit(self.allocator);
     }
 
-    const delegate_vtable = ServerChannelDelegate.VTable{
+    const delegate_vtable = ChannelListenerDelegate.VTable{
         .onConnection = struct {
-            fn f(ptr: *anyopaque, channel: *NamedProcessChannel) void {
+            fn f(ptr: *anyopaque, server: *ChannelListener, channel: *Channel) void {
+                _ = server;
                 const self: *ServiceManager = @ptrCast(@alignCast(ptr));
                 self.onConnection(channel);
             }
         }.f,
         .onClose = struct {
-            fn f(ptr: *anyopaque, channel: *NamedProcessServerChannel) void {
+            fn f(ptr: *anyopaque, server: *ChannelListener) void {
                 const self: *ServiceManager = @ptrCast(@alignCast(ptr));
-                self.onServerChannelClosed(channel);
+                self.onServerChannelClosed(server);
             }
         }.f,
     };
@@ -201,16 +203,18 @@ const ClientContext = struct {
         allocator.destroy(self);
     }
 
-    fn onDataAvailable(self: *ClientContext, client: *NamedProcessChannel, data: []u8) void {
+    fn onDataAvailable(self: *ClientContext, client: *Channel, data: []u8) void {
+        _ = client;
         std.debug.assert(self.task_runner.isCurrentThread());
-        std.debug.assert(client == self.channel);
+        //std.debug.assert(client == self.channel);
         self.read_cb.message = data;
         self.task_runner.postTaskTo(.workers, &self.read_cb.node);
     }
 
-    fn onConnectionClosed(self: *ClientContext, client: *NamedProcessChannel) void {
+    fn onConnectionClosed(self: *ClientContext, client: *Channel) void {
+        _ = client;
         std.debug.assert(self.task_runner.isCurrentThread());
-        std.debug.assert(client == self.channel);
+        //std.debug.assert(client == self.channel);
         std.log.info("ClientContext.onConnectionClosed: client connection closed.", .{});
     }
 
@@ -229,13 +233,13 @@ const ClientContext = struct {
 
     const delegate_vtable = ChannelDelegate.VTable{
         .onDataAvailable = struct {
-            fn f(ptr: *anyopaque, channel: *NamedProcessChannel, data: []u8) void {
+            fn f(ptr: *anyopaque, channel: *Channel, data: []u8) void {
                 const self: *ClientContext = @ptrCast(@alignCast(ptr));
                 self.onDataAvailable(channel, data);
             }
         }.f,
         .onConnectionClosed = struct {
-            fn f(ptr: *anyopaque, channel: *NamedProcessChannel) void {
+            fn f(ptr: *anyopaque, channel: *Channel) void {
                 const self: *ClientContext = @ptrCast(@alignCast(ptr));
                 self.onConnectionClosed(channel);
             }

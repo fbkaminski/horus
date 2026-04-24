@@ -6,7 +6,10 @@ const io_linux = @import("../io/linux.zig");
 const frame_file = @import("frame.zig");
 const named_socket = @import("../net/named_socket.zig");
 const Channel = channel_file.Channel;
+const ChannelListener = channel_file.ChannelListener;
 const ChannelMode = channel_file.ChannelMode;
+const ChannelDelegate = channel_file.ChannelDelegate;
+const ChannelListenerDelegate = channel_file.ChannelListenerDelegate;
 const IO = io_linux.IO;
 const Task = base.Task;
 const TaskQueue = base.TaskQueue;
@@ -22,70 +25,35 @@ const Frame = frame_file.Frame;
 // ALSO: for now this will be here but we need to find a better place
 // as this can be used for any channel
 
-pub const ServerChannelDelegate = struct {
-    ptr: *anyopaque,
-    vtable: *const VTable,
-
-    pub const VTable = struct {
-        onConnection: *const fn (ptr: *anyopaque, client: *NamedProcessChannel) void,
-        onClose: *const fn (ptr: *anyopaque, channel: *NamedProcessServerChannel) void,
-    };
-
-    pub fn onConnection(self: ServerChannelDelegate, client: *NamedProcessChannel) void {
-        self.vtable.onConnection(self.ptr, client);
-    }
-
-    pub fn onClose(self: ServerChannelDelegate, channel: *NamedProcessServerChannel) void {
-        self.vtable.onClose(self.ptr, channel);
-    }
-};
-
-pub const ChannelDelegate = struct {
-    ptr: *anyopaque,
-    vtable: *const VTable,
-
-    pub const VTable = struct {
-        onDataAvailable: *const fn (ptr: *anyopaque, client: *NamedProcessChannel, data: []u8) void,
-        onConnectionClosed: *const fn (ptr: *anyopaque, client: *NamedProcessChannel) void,
-    };
-
-    pub fn onDataAvailable(self: ChannelDelegate, client: *NamedProcessChannel, data: []u8) void {
-        self.vtable.onDataAvailable(self.ptr, client, data);
-    }
-
-    pub fn onConnectionClosed(self: ChannelDelegate, client: *NamedProcessChannel) void {
-        self.vtable.onConnectionClosed(self.ptr, client);
-    }
-};
-
 /// A Named process server (named unix socket backed)
 pub const NamedProcessServerChannel = struct {
     // the base channel
-    base: Channel,
+    base: ChannelListener,
     allocator: std.mem.Allocator,
     connection: NamedServerSocketConnection,
     socket_delegate: NamedServerSocketDelegate,
-    delegate: *ServerChannelDelegate,
+    delegate: *ChannelListenerDelegate,
 
-    pub fn init(self: *NamedProcessServerChannel, allocator: std.mem.Allocator, path: []const u8, io: *IO, delegate: *ServerChannelDelegate) !void {
+    pub fn init(self: *NamedProcessServerChannel, allocator: std.mem.Allocator, path: []const u8, io: *IO, delegate: *ChannelListenerDelegate) !void {
         self.allocator = allocator;
         self.delegate = delegate;
+        // fixme: we probably can do better here
         self.base = .{
             .ptr = self,
-            .vtable = &channel_vtable,
+            .vtable = &listener_channel_vtable,
         };
         self.socket_delegate = .{
             .ptr = self,
             .vtable = &socket_delegate_vtable,
         };
-        self.connection = try NamedServerSocketConnection.create(&self.socket_delegate, io, path);
+        self.connection = try NamedServerSocketConnection.create(allocator, &self.socket_delegate, io, path);
     }
 
     pub fn serve(self: *NamedProcessServerChannel) !void {
         try self.connection.listen();
     }
 
-    pub fn channel(self: *NamedProcessServerChannel) *Channel {
+    pub fn channel(self: *NamedProcessServerChannel) *ChannelListener {
         return &self.base;
     }
 
@@ -93,47 +61,15 @@ pub const NamedProcessServerChannel = struct {
         _ = self;
         return .SERVER;
     }
-
-    pub fn upgrade(self: *NamedProcessServerChannel) void {
-        _ = self;
-    }
-
-    pub fn send(self: *NamedProcessServerChannel, frame: *Frame) void {
-        _ = self;
-        _ = frame;
-    }
-
-    pub fn flush(self: *NamedProcessServerChannel) void {
-        _ = self;
-    }
-
     pub fn close(self: *NamedProcessServerChannel) void {
         self.connection.close();
     }
 
-    const channel_vtable = Channel.VTable{
+    const listener_channel_vtable = ChannelListener.VTable{
         .mode = struct {
             fn f(ptr: *anyopaque) ChannelMode {
                 const self: *NamedProcessServerChannel = @ptrCast(@alignCast(ptr));
                 return self.mode();
-            }
-        }.f,
-        .upgrade = struct {
-            fn f(ptr: *anyopaque) void {
-                const self: *NamedProcessServerChannel = @ptrCast(@alignCast(ptr));
-                return self.upgrade();
-            }
-        }.f,
-        .send = struct {
-            fn f(ptr: *anyopaque, frame: *Frame) void {
-                const self: *NamedProcessServerChannel = @ptrCast(@alignCast(ptr));
-                self.send(frame);
-            }
-        }.f,
-        .flush = struct {
-            fn f(ptr: *anyopaque) void {
-                const self: *NamedProcessServerChannel = @ptrCast(@alignCast(ptr));
-                self.flush();
             }
         }.f,
         .close = struct {
@@ -142,20 +78,27 @@ pub const NamedProcessServerChannel = struct {
                 self.close();
             }
         }.f,
+        .listen = struct {
+            fn f(ptr: *anyopaque) void {
+                const self: *NamedProcessServerChannel = @ptrCast(@alignCast(ptr));
+                // fixme: dont ignore errors here (how to broadcast forward)
+                self.serve() catch return;
+            }
+        }.f,
     };
 
     const socket_delegate_vtable = NamedServerSocketDelegate.VTable{
         .onAccept = struct {
-            fn f(ptr: *anyopaque, socket: NamedSocketConnection) void {
+            fn f(ptr: *anyopaque, socket: *NamedSocketConnection) void {
                 const self: *NamedProcessServerChannel = @ptrCast(@alignCast(ptr));
                 const client = NamedProcessChannel.init(self.allocator, socket) catch return;
-                self.delegate.onConnection(client);
+                self.delegate.onConnection(&self.base, &client.base);
             }
         }.f,
         .onClose = struct {
             fn f(ptr: *anyopaque) void {
                 const self: *NamedProcessServerChannel = @ptrCast(@alignCast(ptr));
-                self.delegate.onClose(self);
+                self.delegate.onClose(&self.base);
             }
         }.f,
     };
@@ -165,13 +108,13 @@ pub const NamedProcessChannel = struct {
     // the base channel
     base: Channel,
     allocator: std.mem.Allocator,
-    connection: NamedSocketConnection,
+    connection: *NamedSocketConnection,
     socket_delegate: NamedSocketDelegate,
     delegate: ?*ChannelDelegate,
 
     pub fn init(
         allocator: std.mem.Allocator,
-        connection: NamedSocketConnection,
+        connection: *NamedSocketConnection,
     ) !*NamedProcessChannel {
         const self = try allocator.create(NamedProcessChannel);
         self.* = .{
@@ -263,13 +206,13 @@ pub const NamedProcessChannel = struct {
         .onRecv = struct {
             fn f(ptr: *anyopaque, data: []u8) void {
                 const self: *NamedProcessChannel = @ptrCast(@alignCast(ptr));
-                self.delegate.?.onDataAvailable(self, data);
+                self.delegate.?.onDataAvailable(&self.base, data);
             }
         }.f,
         .onClose = struct {
             fn f(ptr: *anyopaque) void {
                 const self: *NamedProcessChannel = @ptrCast(@alignCast(ptr));
-                self.delegate.?.onConnectionClosed(self);
+                self.delegate.?.onConnectionClosed(&self.base);
             }
         }.f,
     };
