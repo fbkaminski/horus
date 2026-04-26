@@ -7,6 +7,26 @@ const assert = std.debug.assert;
 
 const is_linux = builtin.target.os.tag == .linux;
 
+pub const DirectIO = enum {
+    direct_io_required,
+    direct_io_optional,
+    direct_io_disabled,
+};
+
+pub fn buffer_limit(buffer_len: usize) usize {
+    // Linux limits how much may be written in a `pwrite()/pread()` call, which is `0x7ffff000` on
+    // both 64-bit and 32-bit systems, due to using a signed C int as the return value, as well as
+    // stuffing the errno codes into the last `4096` values.
+    // Darwin limits writes to `0x7fffffff` bytes, more than that returns `EINVAL`.
+    // The corresponding POSIX limit is `std.math.maxInt(isize)`.
+    const limit = switch (builtin.target.os.tag) {
+        .linux => 0x7ffff000,
+        .macos, .ios, .watchos, .tvos => std.math.maxInt(i32),
+        else => std.math.maxInt(isize),
+    };
+    return @min(limit, buffer_len);
+}
+
 pub const TCPOptions = struct {
     rcvbuf: c_int,
     sndbuf: c_int,
@@ -152,4 +172,11 @@ pub fn aof_blocking_open(dir_fd: posix.fd_t, path: []const u8) !posix.fd_t {
     try file.seekFromEnd(0);
 
     return file.handle;
+}
+
+pub fn cut_prefix(haystack: []const u8, needle: []const u8) ?[]const u8 {
+    if (std.mem.startsWith(u8, haystack, needle)) {
+        return haystack[needle.len..];
+    }
+    return null;
 }

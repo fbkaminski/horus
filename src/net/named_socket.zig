@@ -1,6 +1,7 @@
 const std = @import("std");
-const io_linux = @import("../io/linux.zig");
-const IO = io_linux.IO;
+const builtin = @import("builtin");
+const io_file = if (builtin.os.tag == .linux) @import("../io/linux.zig") else @import("../io/darwin.zig");
+const IO = io_file.IO;
 
 const ConnectionState = enum {
     open,
@@ -15,7 +16,7 @@ pub const NamedSocketConnection = struct {
     socket: std.posix.fd_t,
     recv_completion: IO.Completion,
     cancel_completion: IO.Completion,
-    // FIXME: replace this with an IOBuffer
+    // FIXME: replace this with an IOBuffer /net/io_buffer.zig
     buf: [4096]u8,
     state: ConnectionState,
     pending_ops: u8,
@@ -29,17 +30,31 @@ pub const NamedSocketConnection = struct {
         self.state = .open;
         self.pending_ops = 0;
         self.closed_request = false;
-        self.recv_completion = .{
-            .io = io,
-            .operation = .{
-                .recv = .{
-                    .socket = self.socket,
-                    .buffer = &self.buf,
+        if (builtin.os.tag == .linux) {
+            self.recv_completion = .{
+                .io = io,
+                .operation = .{
+                    .recv = .{
+                        .socket = self.socket,
+                        .buffer = &self.buf,
+                    },
                 },
-            },
-            .context = self,
-            .callback = onDataCompletion,
-        };
+                .context = self,
+                .callback = onDataCompletionLinux,
+            };
+        } else if (builtin.os.tag == .macos) {
+            self.recv_completion = .{
+                .operation = .{
+                    .recv = .{
+                        .socket = self.socket,
+                        .buffer = &self.buf,
+                        .len = self.buf.len,
+                    },
+                },
+                .context = self,
+                .callback = onDataCompletionDarwin,
+            };
+        }
     }
 
     pub fn deinit(self: *NamedSocketConnection) void {
@@ -59,23 +74,33 @@ pub const NamedSocketConnection = struct {
         self.closed_request = true;
         self.state = .closing;
 
-        self.io.cancel(
-            *NamedSocketConnection,
-            self,
-            onCancelComplete,
-            .{
-                .completion = &self.cancel_completion,
-                .target = &self.recv_completion,
-            },
-        );
-        self.pending_ops += 1;
+        if (comptime builtin.os.tag == .macos) {
+            // reset it before calling as is meaningless in the mac os case
+            self.pending_ops = 0;
+            self.tryFinalize();
+        } else {
+            self.io.cancel(
+                *NamedSocketConnection,
+                self,
+                onCancelComplete,
+                .{
+                    .completion = &self.cancel_completion,
+                    .target = &self.recv_completion,
+                },
+            );
+            self.pending_ops += 1;
+        }
     }
 
     fn tryFinalize(self: *NamedSocketConnection) void {
         if (self.pending_ops != 0) return;
         if (self.state == .closed) return;
         self.state = .closed;
-        std.posix.close(self.socket);
+        if (comptime builtin.os.tag == .macos) {
+            self.io.close_socket(self.socket);
+        } else {
+            std.posix.close(self.socket);
+        }
         if (self.delegate) |d| d.onClose();
     }
 
@@ -115,10 +140,14 @@ pub const NamedSocketConnection = struct {
         self.pending_ops += 1;
     }
 
-    fn onDataCompletion(ctx: ?*anyopaque, _: *IO.Completion, result: *const anyopaque) void {
+    fn onDataCompletionLinux(ctx: ?*anyopaque, _: *IO.Completion, result: *const anyopaque) void {
         std.debug.print("NamedProcessChannel.OnDataCompletion: doing nothing here, just asserting it was called", .{});
         _ = ctx;
         _ = result;
+    }
+
+    fn onDataCompletionDarwin(_: *IO, _: *IO.Completion) void {
+        std.debug.print("NamedProcessChannel.OnDataCompletion: doing nothing here, just asserting it was called", .{});
     }
 };
 

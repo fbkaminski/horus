@@ -2,15 +2,15 @@ const builtin = @import("builtin");
 const std = @import("std");
 const channel_file = @import("channel.zig");
 const base = @import("../core/base.zig");
-const io_linux = @import("../io/linux.zig");
 const frame_file = @import("frame.zig");
 const named_socket = @import("../net/named_socket.zig");
+const io_file = if (builtin.os.tag == .linux) @import("../io/linux.zig") else @import("../io/darwin.zig");
+const IO = io_file.IO;
 const Channel = channel_file.Channel;
 const ChannelListener = channel_file.ChannelListener;
 const ChannelMode = channel_file.ChannelMode;
 const ChannelDelegate = channel_file.ChannelDelegate;
 const ChannelListenerDelegate = channel_file.ChannelListenerDelegate;
-const IO = io_linux.IO;
 const Task = base.Task;
 const TaskQueue = base.TaskQueue;
 const NamedSocketConnection = named_socket.NamedSocketConnection;
@@ -18,12 +18,6 @@ const NamedServerSocketConnection = named_socket.NamedServerSocketConnection;
 const NamedServerSocketDelegate = named_socket.NamedServerSocketDelegate;
 const NamedSocketDelegate = named_socket.NamedSocketDelegate;
 const Frame = frame_file.Frame;
-
-// TODO: we need a ServerChannel with serve() as vtable method
-//       but how to mix with the 'normal'/client  Channel?
-
-// ALSO: for now this will be here but we need to find a better place
-// as this can be used for any channel
 
 /// A Named process server (named unix socket backed)
 pub const NamedProcessServerChannel = struct {
@@ -37,7 +31,6 @@ pub const NamedProcessServerChannel = struct {
     pub fn init(self: *NamedProcessServerChannel, allocator: std.mem.Allocator, path: []const u8, io: *IO, delegate: *ChannelListenerDelegate) !void {
         self.allocator = allocator;
         self.delegate = delegate;
-        // fixme: we probably can do better here
         self.base = .{
             .ptr = self,
             .vtable = &listener_channel_vtable,
