@@ -15,8 +15,6 @@ const RunLoopDelegate = runloop.RunLoopDelegate;
 
 threadlocal var current_task_runner: ?*SingleThreadTaskRunner = undefined;
 
-const EventFd = if (builtin.os.tag == .linux) std.posix.fd_t else IO.Event;
-
 pub const SingleThreadTaskRunner = struct {
     allocator: std.mem.Allocator,
     handle: ?std.Thread = null,
@@ -27,7 +25,7 @@ pub const SingleThreadTaskRunner = struct {
     id: std.Thread.Id = undefined,
     thread_type: ThreadId,
     queue: TaskQueue,
-    wake_event: EventFd,
+    wake_event: IO.Event,
     wake_completion: IO.Completion,
     wake_buf: u64 = 0,
     runner: TaskRunner,
@@ -55,7 +53,7 @@ pub const SingleThreadTaskRunner = struct {
         self.running = .{ .raw = false };
         self.thread_type = thread_type;
         self.queue = .{};
-        self.wake_event = if (builtin.os.tag == .linux) try std.posix.eventfd(0, std.os.linux.EFD.NONBLOCK) else try self.io.open_event();
+        self.wake_event = try self.io.open_event();
         self.wake_completion = undefined;
         self.wake_buf = 0;
         self.runner = .{
@@ -166,32 +164,13 @@ pub const SingleThreadTaskRunner = struct {
     }
 
     pub fn wake(self: *SingleThreadTaskRunner) void {
-        if (comptime builtin.os.tag == .linux) {
-            const flag: u64 = 1;
-            _ = std.posix.write(self.wake_event, std.mem.asBytes(&flag)) catch |err| {
-                std.log.err("wakefd write failed: {}", .{err});
-                return;
-            };
-        } else {
-            self.io.event_trigger(self.wake_event, &self.wake_completion);
-        }
+        self.io.event_trigger(self.wake_event, &self.wake_completion);
     }
-    fn onWakeLinux(self: *SingleThreadTaskRunner, completion: *IO.Completion, result: IO.ReadError!usize) void {
-        std.debug.assert(self.isCurrentThread());
-        const n: usize = result catch |err| blk: {
-            std.debug.print("wakefd error: {}\n", .{err});
-            break :blk 0;
-        };
-        if (n > 0) std.debug.assert(n == 8);
-        self.drain();
-        self.armWake();
-        _ = completion;
-    }
-    fn onWakeDarwin(completion: *IO.Completion) void {
+    fn onWake(completion: *IO.Completion) void {
         const self: *SingleThreadTaskRunner = @fieldParentPtr("wake_completion", completion);
         // Re-arm for next wakeup before draining tasks
-        self.drain();
         self.armWake();
+        self.drain();
     }
 
     fn drain(self: *SingleThreadTaskRunner) void {
@@ -203,19 +182,7 @@ pub const SingleThreadTaskRunner = struct {
 
     fn armWake(self: *SingleThreadTaskRunner) void {
         std.debug.assert(self.isCurrentThread());
-        if (comptime builtin.os.tag == .linux) {
-            self.io.read(
-                *SingleThreadTaskRunner,
-                self,
-                onWakeLinux,
-                &self.wake_completion,
-                self.wake_event,
-                std.mem.asBytes(&self.wake_buf),
-                0,
-            );
-        } else {
-            self.io.event_listen(self.wake_event, &self.wake_completion, onWakeDarwin);
-        }
+        self.io.event_listen(self.wake_event, &self.wake_completion, onWake);
     }
 
     fn enterThread(self: *SingleThreadTaskRunner) void {
