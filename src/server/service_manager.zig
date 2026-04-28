@@ -222,16 +222,15 @@ const ClientContext = struct {
 
     fn processIncomingDataOnWorkerThread(self: *ClientContext, buffer: *IOBuffer) void {
         // we will use the buffer here
-        //buffer.ref();
         std.log.info("ClientContext.processIncomingDataOnWorkerThread: processing message \"{s}\" on task_runner {d}", .{ buffer.readable(), std.Thread.getCurrentId() });
-        // we are done with the buffer here
-        buffer.unref();
         self.task_runner.postTaskTo(.service, &self.read_cb.response_node);
     }
 
     fn processIncomingDataReplyOnServiceThread(self: *ClientContext, client: *NamedProcessChannel) void {
         std.debug.assert(self.task_runner.isCurrentThread());
         std.log.info("ClientContext.processIncomingDataReplyOnServiceThread: response after readDataOnWorkerThread on task_runner {d}\n", .{std.Thread.getCurrentId()});
+        // we are done with the buffer here
+        self.read_cb.buffer.unref();
         client.deinit();
         // this will clean ourselves
         self.service_manager.onContextDone(self);

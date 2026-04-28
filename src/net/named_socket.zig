@@ -67,12 +67,12 @@ pub const NamedSocketConnection = struct {
     }
 
     pub fn deinit(self: *NamedSocketConnection) void {
-        self.close();
         if (self.recv_buf) |buf| {
             buf.unref();
             self.recv_buf = null;
         }
         self.buffer_pool.deinit();
+        self.close();
         self.allocator.destroy(self);
     }
 

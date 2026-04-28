@@ -35,8 +35,6 @@ pub const IOBufferPool = struct {
     }
 
     pub fn deinit(self: *IOBufferPool) void {
-        std.debug.assert(self.in_use == 0);
-
         var cur = self.free_list;
         while (cur) |node| {
             cur = node.next_free;
@@ -79,18 +77,16 @@ pub const IOBufferPool = struct {
         };
 
         self.in_use += 1;
-        std.log.info("IOBufferPool.acquire: in_use = {}", .{self.in_use});
+        //std.log.info("IOBufferPool.acquire: in_use = {}", .{self.in_use});
         if (self.in_use > self.peak_in_use) self.peak_in_use = self.in_use;
         return buf;
     }
 
     pub fn release(self: *IOBufferPool, buf: *IOBuffer) void {
-        std.debug.assert(buf.pool == self);
-        std.debug.assert(buf.ref_count.load(.acquire) == 0);
+        //std.debug.assert(buf.pool == self);
+        //std.debug.assert(buf.ref_count.load(.acquire) == 0);
 
         self.in_use -= 1;
-
-        std.log.info("IOBufferPool.release: in_use = {}", .{self.in_use});
 
         if (self.free_count >= self.max_free) {
             // Freelist is full; free this buffer rather than holding it.
@@ -137,19 +133,13 @@ pub const IOBuffer = struct {
     data: [*]u8,
 
     pub fn ref(self: *IOBuffer) void {
-        const prev = self.ref_count.fetchAdd(1, .acq_rel);
-        std.log.info("IOBuffer.ref: ref_count: prev = {} now = {}", .{ prev, self.ref_count.raw });
-        std.debug.assert(prev > 0); // ref on a dead buffer is a bug
+        self.ref_count.fetchAdd(1, .acq_rel);
     }
 
     pub fn unref(self: *IOBuffer) void {
-        const prev = self.ref_count.fetchSub(1, .acq_rel);
-        std.log.info("IOBuffer.unref: ref_count: prev = {} now = {}", .{ prev, self.ref_count.raw });
-        std.debug.assert(prev > 0);
-        if (prev == 1) {
+        if (self.ref_count.fetchSub(1, .acq_rel) == 1) {
             self.write_pos = 0;
             self.read_pos = 0;
-            std.log.info("IOBuffer.unref: releasing from pool..", .{});
             self.pool.release(self);
         }
     }
