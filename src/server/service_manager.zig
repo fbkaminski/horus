@@ -195,7 +195,7 @@ const ClientContext = struct {
             },
             .context = self,
             .channel = channel,
-            .buffer = undefined,
+            .buffer = null,
         };
         // define ourselves as the delegate of the client channel
         self.channel.setDelegate(&self.delegate);
@@ -229,8 +229,6 @@ const ClientContext = struct {
     fn processIncomingDataReplyOnServiceThread(self: *ClientContext, client: *NamedProcessChannel) void {
         std.debug.assert(self.task_runner.isCurrentThread());
         std.log.info("ClientContext.processIncomingDataReplyOnServiceThread: response after readDataOnWorkerThread on task_runner {d}\n", .{std.Thread.getCurrentId()});
-        // we are done with the buffer here
-        self.read_cb.buffer.unref();
         client.deinit();
         // this will clean ourselves
         self.service_manager.onContextDone(self);
@@ -241,6 +239,7 @@ const ClientContext = struct {
             fn f(ptr: *anyopaque, channel: *Channel, buffer: *IOBuffer) void {
                 const self: *ClientContext = @ptrCast(@alignCast(ptr));
                 self.onDataAvailable(channel, buffer);
+                buffer.unref();
             }
         }.f,
         .onConnectionClosed = struct {
@@ -258,11 +257,11 @@ const ClientContext = struct {
         response_node: TaskQueue.Node = .{ .value = undefined },
         context: *ClientContext,
         channel: *NamedProcessChannel,
-        buffer: *IOBuffer,
+        buffer: ?*IOBuffer,
 
         fn callback(task: *Task) void {
             const self: *ReadCallback = @fieldParentPtr("task", task);
-            self.context.processIncomingDataOnWorkerThread(self.buffer);
+            self.context.processIncomingDataOnWorkerThread(self.buffer.?);
         }
 
         fn responseCallback(t: *Task) void {

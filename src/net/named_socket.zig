@@ -26,6 +26,7 @@ pub const NamedSocketConnection = struct {
     closed_request: bool,
     // whether the io backend supports cancelation
     io_supports_cancellation: bool,
+    want_destroy: bool,
 
     pub fn init(self: *NamedSocketConnection, allocator: std.mem.Allocator, io: *IO, socket: std.posix.fd_t) void {
         self.allocator = allocator;
@@ -37,6 +38,7 @@ pub const NamedSocketConnection = struct {
         self.state = .open;
         self.pending_ops = 0;
         self.closed_request = false;
+        self.want_destroy = false;
         if (builtin.os.tag == .linux) {
             self.recv_completion = .{
                 .io = io,
@@ -67,12 +69,18 @@ pub const NamedSocketConnection = struct {
     }
 
     pub fn deinit(self: *NamedSocketConnection) void {
+        self.delegate = null;
+        self.want_destroy = true;
+        self.close();
+        if (self.state == .closed and self.pending_ops == 0) self.finalize();
+    }
+
+    fn finalize(self: *NamedSocketConnection) void {
         if (self.recv_buf) |buf| {
             buf.unref();
             self.recv_buf = null;
         }
         self.buffer_pool.deinit();
-        self.close();
         self.allocator.destroy(self);
     }
 
@@ -111,6 +119,7 @@ pub const NamedSocketConnection = struct {
         if (self.pending_ops != 0) return;
         self.closeNativeSocket();
         if (self.delegate) |d| d.onClose();
+        if (self.want_destroy) self.finalize();
     }
 
     fn closeNativeSocket(self: *NamedSocketConnection) void {
