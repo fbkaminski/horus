@@ -4,6 +4,7 @@ const channel_file = @import("channel.zig");
 const base = @import("../core/base.zig");
 const frame_file = @import("frame.zig");
 const named_socket = @import("../net/named_socket.zig");
+const io_buffer = @import("../net/io_buffer.zig");
 const io_file = if (builtin.os.tag == .linux) @import("../io/linux.zig") else @import("../io/darwin.zig");
 const IO = io_file.IO;
 const Channel = channel_file.Channel;
@@ -18,6 +19,7 @@ const NamedServerSocketConnection = named_socket.NamedServerSocketConnection;
 const NamedServerSocketDelegate = named_socket.NamedServerSocketDelegate;
 const NamedSocketDelegate = named_socket.NamedSocketDelegate;
 const Frame = frame_file.Frame;
+const IOBuffer = io_buffer.IOBuffer;
 
 /// A Named process server (named unix socket backed)
 pub const NamedProcessServerChannel = struct {
@@ -197,9 +199,9 @@ pub const NamedProcessChannel = struct {
 
     const socket_delegate_vtable = NamedSocketDelegate.VTable{
         .onRecv = struct {
-            fn f(ptr: *anyopaque, data: []u8) void {
+            fn f(ptr: *anyopaque, buffer: *IOBuffer) void {
                 const self: *NamedProcessChannel = @ptrCast(@alignCast(ptr));
-                self.delegate.?.onDataAvailable(&self.base, data);
+                self.delegate.?.onDataAvailable(&self.base, buffer);
             }
         }.f,
         .onClose = struct {

@@ -28,8 +28,10 @@ const work_queue = @import("../core/work_queue.zig");
 const service_file = @import("service.zig");
 const channel_file = @import("../channel/channel.zig");
 const named_channel_file = @import("../channel/named_process_channel.zig");
+const io_buffer = @import("../net/io_buffer.zig");
 const io_file = if (builtin.os.tag == .linux) @import("../io/linux.zig") else @import("../io/darwin.zig");
 const IO = io_file.IO;
+const IOBuffer = io_buffer.IOBuffer;
 const SingleThreadTaskRunner = thread_file.SingleThreadTaskRunner;
 const ThreadRegistry = thread_registry_file.ThreadRegistry;
 const Task = base.Task;
@@ -193,7 +195,7 @@ const ClientContext = struct {
             },
             .context = self,
             .channel = channel,
-            .message = undefined,
+            .buffer = undefined,
         };
         // define ourselves as the delegate of the client channel
         self.channel.setDelegate(&self.delegate);
@@ -203,11 +205,11 @@ const ClientContext = struct {
         allocator.destroy(self);
     }
 
-    fn onDataAvailable(self: *ClientContext, client: *Channel, data: []u8) void {
+    fn onDataAvailable(self: *ClientContext, client: *Channel, buffer: *IOBuffer) void {
         _ = client;
         std.debug.assert(self.task_runner.isCurrentThread());
         //std.debug.assert(client == self.channel);
-        self.read_cb.message = data;
+        self.read_cb.buffer = buffer;
         self.task_runner.postTaskTo(.workers, &self.read_cb.node);
     }
 
@@ -218,14 +220,18 @@ const ClientContext = struct {
         std.log.info("ClientContext.onConnectionClosed: client connection closed.", .{});
     }
 
-    fn processIncomingDataOnWorkerThread(self: *ClientContext, buf: []u8) void {
-        std.log.info("ClientContext.recvOnWorkerThread: processing message \"{s}\" on task_runner {d}", .{ buf, std.Thread.getCurrentId() });
+    fn processIncomingDataOnWorkerThread(self: *ClientContext, buffer: *IOBuffer) void {
+        // we will use the buffer here
+        //buffer.ref();
+        std.log.info("ClientContext.processIncomingDataOnWorkerThread: processing message \"{s}\" on task_runner {d}", .{ buffer.readable(), std.Thread.getCurrentId() });
+        // we are done with the buffer here
+        buffer.unref();
         self.task_runner.postTaskTo(.service, &self.read_cb.response_node);
     }
 
     fn processIncomingDataReplyOnServiceThread(self: *ClientContext, client: *NamedProcessChannel) void {
         std.debug.assert(self.task_runner.isCurrentThread());
-        std.log.info("ClientContext.closeConnectionOnServiceThread: response after readDataOnWorkerThread on task_runner {d}\n", .{std.Thread.getCurrentId()});
+        std.log.info("ClientContext.processIncomingDataReplyOnServiceThread: response after readDataOnWorkerThread on task_runner {d}\n", .{std.Thread.getCurrentId()});
         client.deinit();
         // this will clean ourselves
         self.service_manager.onContextDone(self);
@@ -233,9 +239,9 @@ const ClientContext = struct {
 
     const delegate_vtable = ChannelDelegate.VTable{
         .onDataAvailable = struct {
-            fn f(ptr: *anyopaque, channel: *Channel, data: []u8) void {
+            fn f(ptr: *anyopaque, channel: *Channel, buffer: *IOBuffer) void {
                 const self: *ClientContext = @ptrCast(@alignCast(ptr));
-                self.onDataAvailable(channel, data);
+                self.onDataAvailable(channel, buffer);
             }
         }.f,
         .onConnectionClosed = struct {
@@ -253,11 +259,11 @@ const ClientContext = struct {
         response_node: TaskQueue.Node = .{ .value = undefined },
         context: *ClientContext,
         channel: *NamedProcessChannel,
-        message: []u8,
+        buffer: *IOBuffer,
 
         fn callback(task: *Task) void {
             const self: *ReadCallback = @fieldParentPtr("task", task);
-            self.context.processIncomingDataOnWorkerThread(self.message);
+            self.context.processIncomingDataOnWorkerThread(self.buffer);
         }
 
         fn responseCallback(t: *Task) void {

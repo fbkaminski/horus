@@ -127,22 +127,6 @@ pub const SingleThreadTaskRunner = struct {
         }
     }
 
-    pub fn bindToIO(self: *SingleThreadTaskRunner, io: *IO) void {
-        if (comptime builtin.os.tag == .linux) {
-            io.read(
-                *SingleThreadTaskRunner,
-                self,
-                onWakeLinux,
-                &self.wake_completion,
-                self.wake_event,
-                std.mem.asBytes(&self.wake_buf),
-                0,
-            );
-        } else {
-            io.event_listen(self.wake_event, &self.wake_completion, onWakeDarwin);
-        }
-    }
-
     pub fn postTask(self: *SingleThreadTaskRunner, node: *TaskQueue.Node) void {
         self.queue.push(node);
         self.wake();
@@ -193,20 +177,21 @@ pub const SingleThreadTaskRunner = struct {
         }
     }
     fn onWakeLinux(self: *SingleThreadTaskRunner, completion: *IO.Completion, result: IO.ReadError!usize) void {
+        std.debug.assert(self.isCurrentThread());
         const n: usize = result catch |err| blk: {
             std.debug.print("wakefd error: {}\n", .{err});
             break :blk 0;
         };
         if (n > 0) std.debug.assert(n == 8);
         self.drain();
-        self.bindToIO(&self.io);
+        self.armWake();
         _ = completion;
     }
     fn onWakeDarwin(completion: *IO.Completion) void {
         const self: *SingleThreadTaskRunner = @fieldParentPtr("wake_completion", completion);
         // Re-arm for next wakeup before draining tasks
         self.drain();
-        self.bindToIO(&self.io);
+        self.armWake();
     }
 
     fn drain(self: *SingleThreadTaskRunner) void {
@@ -216,9 +201,26 @@ pub const SingleThreadTaskRunner = struct {
         }
     }
 
+    fn armWake(self: *SingleThreadTaskRunner) void {
+        std.debug.assert(self.isCurrentThread());
+        if (comptime builtin.os.tag == .linux) {
+            self.io.read(
+                *SingleThreadTaskRunner,
+                self,
+                onWakeLinux,
+                &self.wake_completion,
+                self.wake_event,
+                std.mem.asBytes(&self.wake_buf),
+                0,
+            );
+        } else {
+            self.io.event_listen(self.wake_event, &self.wake_completion, onWakeDarwin);
+        }
+    }
+
     fn enterThread(self: *SingleThreadTaskRunner) void {
         self.id = std.Thread.getCurrentId();
-        self.bindToIO(&self.io);
+        self.armWake();
         self.running.store(true, .release);
         current_task_runner = self;
     }

@@ -1,7 +1,9 @@
 //
 const std = @import("std");
+const io_buffer = @import("../net/io_buffer.zig");
 const frame_file = @import("frame.zig");
 const Frame = frame_file.Frame;
+const IOBuffer = io_buffer.IOBuffer;
 
 pub const ChannelMode = enum {
     SERVER,
@@ -88,12 +90,12 @@ pub const ChannelDelegate = struct {
     vtable: *const VTable,
 
     pub const VTable = struct {
-        onDataAvailable: *const fn (ptr: *anyopaque, client: *Channel, data: []u8) void,
+        onDataAvailable: *const fn (ptr: *anyopaque, client: *Channel, buffer: *IOBuffer) void,
         onConnectionClosed: *const fn (ptr: *anyopaque, client: *Channel) void,
     };
 
-    pub fn onDataAvailable(self: ChannelDelegate, client: *Channel, data: []u8) void {
-        self.vtable.onDataAvailable(self.ptr, client, data);
+    pub fn onDataAvailable(self: ChannelDelegate, client: *Channel, buffer: *IOBuffer) void {
+        self.vtable.onDataAvailable(self.ptr, client, buffer);
     }
 
     pub fn onConnectionClosed(self: ChannelDelegate, client: *Channel) void {
