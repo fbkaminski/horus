@@ -55,8 +55,8 @@ pub const NamedSocketConnection = struct {
                 .operation = .{
                     .recv = .{
                         .socket = self.socket,
-                        .buffer = &self.buf,
-                        .len = self.buf.len,
+                        .buffer = undefined,
+                        .len = 0,
                     },
                 },
                 .context = self,

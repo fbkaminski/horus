@@ -49,8 +49,8 @@ pub const Platform = struct {
         // start the service manager
         try self.service_manager.spawn();
 
-        //const quit_closure = try self.runloop.quitClosure(self.allocator);
-        //self.main_task_runner.postDelayedTask(5000 * std.time.ns_per_ms, &quit_closure.node);
+        const quit_closure = try self.runloop.quitClosure(self.allocator);
+        self.main_task_runner.postDelayedTask(10000 * std.time.ns_per_ms, &quit_closure.node);
         // run the main thread
         self.runloop.run();
     }
