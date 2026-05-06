@@ -1,9 +1,16 @@
 //
 const std = @import("std");
+const builtin = @import("builtin");
 const io_buffer = @import("../net/io_buffer.zig");
+const io_file = if (builtin.os.tag == .linux) @import("../io/linux.zig") else @import("../io/darwin.zig");
 const frame_file = @import("frame.zig");
 const Frame = frame_file.Frame;
 const IOBuffer = io_buffer.IOBuffer;
+// FIXME: the IO layer shouldnt leak here
+//        its here for the error messages
+// TODO:  create internal error messages
+//
+const IO = io_file.IO;
 
 pub const ChannelMode = enum {
     SERVER,
@@ -90,15 +97,45 @@ pub const ChannelDelegate = struct {
     vtable: *const VTable,
 
     pub const VTable = struct {
-        onDataAvailable: *const fn (ptr: *anyopaque, client: *Channel, buffer: *IOBuffer) void,
+        onConnection: *const fn (ptr: *anyopaque, client: *Channel) void,
+        onConnectionFailed: *const fn (ptr: *anyopaque, client: *Channel, err: IO.ConnectError) void,
+        onDisconnect: *const fn (ptr: *anyopaque, client: *Channel) void,
         onConnectionClosed: *const fn (ptr: *anyopaque, client: *Channel) void,
+        onReceive: *const fn (ptr: *anyopaque, client: *Channel, buffer: *IOBuffer) void,
+        onReceiveFailed: *const fn (ptr: *anyopaque, client: *Channel, err: IO.RecvError) void,
+        onSend: *const fn (ptr: *anyopaque, client: *Channel, sent: usize) void,
+        onSendFailed: *const fn (ptr: *anyopaque, client: *Channel, err: IO.SendError) void,
     };
 
-    pub fn onDataAvailable(self: ChannelDelegate, client: *Channel, buffer: *IOBuffer) void {
-        self.vtable.onDataAvailable(self.ptr, client, buffer);
+    pub fn onConnection(self: ChannelDelegate, client: *Channel) void {
+        self.vtable.onConnection(self.ptr, client);
+    }
+
+    pub fn onConnectionFailed(self: ChannelDelegate, client: *Channel, err: IO.ConnectError) void {
+        self.vtable.onConnectionFailed(self.ptr, client, err);
+    }
+
+    pub fn onDisconnect(self: ChannelDelegate, client: *Channel) void {
+        self.vtable.onDisconnect(self.ptr, client);
     }
 
     pub fn onConnectionClosed(self: ChannelDelegate, client: *Channel) void {
         self.vtable.onConnectionClosed(self.ptr, client);
+    }
+
+    pub fn onReceive(self: ChannelDelegate, client: *Channel, buffer: *IOBuffer) void {
+        self.vtable.onReceive(self.ptr, client, buffer);
+    }
+
+    pub fn onReceiveFailed(self: ChannelDelegate, client: *Channel, err: IO.RecvError) void {
+        self.vtable.onReceiveFailed(self.ptr, client, err);
+    }
+
+    pub fn onSend(self: ChannelDelegate, client: *Channel, sent: usize) void {
+        self.vtable.onSend(self.ptr, client, sent);
+    }
+
+    pub fn onSendFailed(self: ChannelDelegate, client: *Channel, err: IO.SendError) void {
+        self.vtable.onSendFailed(self.ptr, client, err);
     }
 };

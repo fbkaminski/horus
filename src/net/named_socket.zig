@@ -7,96 +7,89 @@ const IOBuffer = io_buffer.IOBuffer;
 const IOBufferPool = io_buffer.IOBufferPool;
 
 const ConnectionState = enum {
+    init,
+    opening,
     open,
     closing,
     closed,
 };
 
-pub const NamedSocketConnection = struct {
+pub const NamedSocket = struct {
     allocator: std.mem.Allocator,
     delegate: ?*NamedSocketDelegate,
     io: *IO,
-    socket: std.posix.fd_t,
+    socket: ?std.posix.fd_t,
     recv_completion: IO.Completion,
     cancel_completion: IO.Completion,
+    connect_completion: IO.Completion,
+    write_completion: IO.Completion,
     recv_buf: ?*IOBuffer,
+    write_buf: ?*IOBuffer,
     buffer_pool: IOBufferPool,
     state: ConnectionState,
     pending_ops: u8,
-    closed_request: bool,
     // whether the io backend supports cancelation
     io_supports_cancellation: bool,
 
-    pub fn init(self: *NamedSocketConnection, allocator: std.mem.Allocator, io: *IO, socket: std.posix.fd_t) void {
+    pub fn init(allocator: std.mem.Allocator, io: *IO) *NamedSocket {
+        var self = allocator.create(NamedSocket) catch return undefined;
         self.allocator = allocator;
         self.delegate = null;
         self.io = io;
-        self.socket = socket;
+        self.socket = null;
         self.recv_buf = null;
+        self.write_buf = null;
         self.buffer_pool = IOBufferPool.init(allocator, .{});
-        self.state = .open;
+        self.state = .init;
         self.pending_ops = 0;
-        self.closed_request = false;
         if (builtin.os.tag == .linux) {
-            self.recv_completion = .{
-                .io = io,
-                .operation = .{
-                    .recv = .{
-                        .socket = self.socket,
-                        .buffer = undefined,
-                    },
-                },
-                .context = self,
-                .callback = onDataCompletionLinux,
-            };
             self.io_supports_cancellation = true;
         } else if (builtin.os.tag == .macos) {
-            self.recv_completion = .{
-                .operation = .{
-                    .recv = .{
-                        .socket = self.socket,
-                        .buffer = undefined,
-                        .len = 0,
-                    },
-                },
-                .context = self,
-                .callback = onDataCompletionDarwin,
-            };
             self.io_supports_cancellation = false;
         }
+        return self;
     }
 
-    pub fn deinit(self: *NamedSocketConnection) void {
+    pub fn connect(self: *NamedSocket, path: []const u8) !void {
+        self.state = .opening;
+        const address = try std.net.Address.initUnix(path);
+        const sock = try std.posix.socket(
+            std.posix.AF.UNIX,
+            std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC,
+            0,
+        );
+        self.socket = sock;
+        self.incrementPendingOps();
+        self.io.connect(
+            *NamedSocket,
+            self,
+            onConnect,
+            &self.connect_completion,
+            sock,
+            address,
+        );
+    }
+
+    pub fn deinit(self: *NamedSocket) void {
         self.delegate = null;
-        self.close();
-        std.debug.assert(self.state == .closed and self.pending_ops == 0);
+        self.closeSocket();
         self.finalize();
     }
 
-    fn finalize(self: *NamedSocketConnection) void {
-        if (self.recv_buf) |buf| {
-            buf.unref();
-            self.recv_buf = null;
-        }
-        self.buffer_pool.deinit();
-        self.allocator.destroy(self);
-    }
-
-    pub fn setDelegate(self: *NamedSocketConnection, delegate: *NamedSocketDelegate) void {
+    pub fn setDelegate(self: *NamedSocket, delegate: ?*NamedSocketDelegate) void {
         self.delegate = delegate;
-        // arm the first recv as now we have a delegate to call back
-        self.armRecv();
     }
 
-    pub fn close(self: *NamedSocketConnection) void {
-        if (self.closed_request) return;
+    pub fn close(self: *NamedSocket) void {
+        if (self.state == .closing) {
+            return;
+        }
 
-        self.closed_request = true;
         self.state = .closing;
 
-        if (self.io_supports_cancellation) {
+        if (self.io_supports_cancellation and self.pending_ops > 0) {
             self.io.cancel(
-                *NamedSocketConnection,
+                *NamedSocket,
                 self,
                 onCancelComplete,
                 .{
@@ -112,39 +105,118 @@ pub const NamedSocketConnection = struct {
         }
     }
 
-    fn closeSocket(self: *NamedSocketConnection) void {
-        if (self.state == .closed) return;
+    pub fn send(self: *NamedSocket, buf: *IOBuffer) void {
+        self.write_buf = buf;
+        // we are owning it temporarily now, so refcount it
+        self.write_buf.?.ref();
+        const data = self.write_buf.?.readable();
+        self.incrementPendingOps();
+        self.io.send(
+            *NamedSocket,
+            self,
+            onSend,
+            &self.write_completion,
+            self.socket.?,
+            data,
+        );
+    }
+
+    fn accept(self: *NamedSocket, socket: std.posix.fd_t) void {
+        self.socket = socket;
+        self.state = .open;
+        if (builtin.os.tag == .linux) {
+            self.recv_completion = .{
+                .io = self.io,
+                .operation = .{
+                    .recv = .{
+                        .socket = self.socket.?,
+                        .buffer = undefined,
+                    },
+                },
+                .context = self,
+                .callback = onDataCompletionLinux,
+            };
+        } else if (builtin.os.tag == .macos) {
+            self.recv_completion = .{
+                .operation = .{
+                    .recv = .{
+                        .socket = self.socket.?,
+                        .buffer = undefined,
+                        .len = 0,
+                    },
+                },
+                .context = self,
+                .callback = onDataCompletionDarwin,
+            };
+        }
+        // arm the first recv after being sucessfully connected
+        self.armRecv();
+    }
+
+    fn closeSocket(self: *NamedSocket) void {
+        if (self.state == .closed) {
+            return;
+        }
         if (self.pending_ops != 0) return;
         self.closeNativeSocket();
         if (self.delegate) |d| d.onClose();
     }
 
-    fn closeNativeSocket(self: *NamedSocketConnection) void {
+    fn closeNativeSocket(self: *NamedSocket) void {
         if (comptime builtin.os.tag == .macos) {
-            self.io.close_socket(self.socket);
+            self.io.close_socket(self.socket.?);
         } else {
-            std.posix.close(self.socket);
+            std.posix.close(self.socket.?);
         }
         self.state = .closed;
     }
 
-    fn onCancelComplete(self: *NamedSocketConnection, _: *IO.Completion, _: IO.CancelError!void) void {
+    fn onConnect(self: *NamedSocket, _: *IO.Completion, err: IO.ConnectError!void) void {
+        err catch |e| {
+            if (self.delegate) |d| d.onConnectionFailed(e);
+            self.state = .closing;
+            return;
+        };
+        self.state = .open;
+        if (self.delegate) |d| d.onConnection();
+        // arm the first recv after being sucessfully connected
+        self.armRecv();
+        self.decrementPendingOps();
+    }
+
+    fn onCancelComplete(self: *NamedSocket, _: *IO.Completion, _: IO.CancelError!void) void {
         self.decrementPendingOps();
         self.closeSocket();
     }
 
-    fn onRecv(self: *NamedSocketConnection, _: *IO.Completion, result: IO.RecvError!usize) void {
+    fn onSend(self: *NamedSocket, _: *IO.Completion, result: IO.SendError!usize) void {
+        if (self.write_buf) |buf| {
+            buf.unref();
+            self.write_buf = null;
+        }
+        const size = result catch |e| {
+            if (self.delegate) |d| d.onSendFailed(e);
+            return;
+        };
+        //std.log.info("send completion: wrote {} bytes", .{size});
+        if (self.delegate) |d| d.onSend(size);
+        self.decrementPendingOps();
+    }
+
+    fn onRecv(self: *NamedSocket, _: *IO.Completion, result: IO.RecvError!usize) void {
         self.decrementPendingOps();
         if (self.state == .closing) {
             self.closeSocket();
             return;
         }
-        const n = result catch {
+        const n = result catch |e| {
+            if (self.delegate) |d| d.onRecvFailed(e);
             self.close();
             return;
         };
         if (n == 0) {
             // connection is gone
+            if (self.delegate) |d| d.onDisconnect();
             self.close();
             return;
         }
@@ -156,40 +228,42 @@ pub const NamedSocketConnection = struct {
         self.armRecv();
     }
 
-    fn armRecv(self: *NamedSocketConnection) void {
+    fn armRecv(self: *NamedSocket) void {
+        if (self.state != .open) return;
+
         self.recv_buf = self.buffer_pool.acquire() catch return;
         self.io.recv(
-            *NamedSocketConnection,
+            *NamedSocket,
             self,
             onRecv,
             &self.recv_completion,
-            self.socket,
+            self.socket.?,
             self.recv_buf.?.writable(),
         );
         self.incrementPendingOps();
     }
 
-    fn onDataCompletionLinux(ctx: ?*anyopaque, _: *IO.Completion, result: *const anyopaque) void {
-        std.debug.print("NamedProcessChannel.OnDataCompletion: doing nothing here, just asserting it was called", .{});
-        _ = ctx;
-        _ = result;
-    }
-
-    fn onDataCompletionDarwin(_: *IO, _: *IO.Completion) void {
-        std.debug.print("NamedProcessChannel.OnDataCompletion: doing nothing here, just asserting it was called", .{});
+    fn finalize(self: *NamedSocket) void {
+        if (self.recv_buf) |buf| {
+            buf.unref();
+            self.recv_buf = null;
+        }
+        self.buffer_pool.deinit();
+        self.allocator.destroy(self);
     }
 
     // inline helpers so he dont have this check spread everywhere we use them
-    inline fn incrementPendingOps(self: *NamedSocketConnection) void {
+    inline fn incrementPendingOps(self: *NamedSocket) void {
         if (self.io_supports_cancellation) self.pending_ops += 1;
     }
 
-    inline fn decrementPendingOps(self: *NamedSocketConnection) void {
+    inline fn decrementPendingOps(self: *NamedSocket) void {
         if (self.io_supports_cancellation) self.pending_ops -= 1;
     }
 };
 
-pub const NamedServerSocketConnection = struct {
+// TODO: we need a state-machine here too
+pub const NamedServerSocket = struct {
     allocator: std.mem.Allocator,
     delegate: *NamedServerSocketDelegate,
     io: *IO,
@@ -198,7 +272,7 @@ pub const NamedServerSocketConnection = struct {
     closed: bool,
     accept_completion: IO.Completion,
 
-    pub fn create(allocator: std.mem.Allocator, delegate: *NamedServerSocketDelegate, io: *IO, path: []const u8) !NamedServerSocketConnection {
+    pub fn create(allocator: std.mem.Allocator, delegate: *NamedServerSocketDelegate, io: *IO, path: []const u8) !NamedServerSocket {
         const socket = try std.posix.socket(
             std.posix.AF.UNIX,
             std.posix.SOCK.STREAM | std.posix.SOCK.NONBLOCK | std.posix.SOCK.CLOEXEC,
@@ -220,11 +294,11 @@ pub const NamedServerSocketConnection = struct {
         };
     }
 
-    pub fn deinit(self: *NamedServerSocketConnection) void {
+    pub fn deinit(self: *NamedServerSocket) void {
         self.close();
     }
 
-    pub fn close(self: *NamedServerSocketConnection) void {
+    pub fn close(self: *NamedServerSocket) void {
         if (!self.closed) {
             std.posix.close(self.socket);
             self.closed = true;
@@ -232,7 +306,7 @@ pub const NamedServerSocketConnection = struct {
         }
     }
 
-    pub fn listen(self: *NamedServerSocketConnection) !void {
+    pub fn listen(self: *NamedServerSocket) !void {
         // bind to path
         var addr: std.posix.sockaddr.un = .{ .family = std.posix.AF.UNIX, .path = undefined };
         @memset(&addr.path, 0);
@@ -245,9 +319,9 @@ pub const NamedServerSocketConnection = struct {
         try self.armAccept();
     }
 
-    fn armAccept(self: *NamedServerSocketConnection) !void {
+    fn armAccept(self: *NamedServerSocket) !void {
         self.io.accept(
-            *NamedServerSocketConnection,
+            *NamedServerSocket,
             self,
             onAccept,
             &self.accept_completion,
@@ -255,23 +329,23 @@ pub const NamedServerSocketConnection = struct {
         );
     }
 
-    fn onAccept(self: *NamedServerSocketConnection, _: *IO.Completion, result: IO.AcceptError!std.posix.fd_t) void {
+    fn onAccept(self: *NamedServerSocket, _: *IO.Completion, result: IO.AcceptError!std.posix.fd_t) void {
         const client_fd = result catch |err| {
-            std.log.err("NamedServerSocketConnection onAccept: failed getting the accepted socket", .{});
+            std.log.err("NamedServerSocket onAccept: failed getting the accepted socket", .{});
             if (err == error.Canceled) return;
             self.armAccept() catch {
-                std.log.err("NamedServerSocketConnection IO.accept: failed to schedule accept", .{});
+                std.log.err("NamedServerSocket IO.accept: failed to schedule accept", .{});
                 return;
             };
             return;
         };
-        const conn = self.allocator.create(NamedSocketConnection) catch return;
-        conn.init(self.allocator, self.io, client_fd);
-        // the delegate is responsible for the NamedSocketConnection ownership/cleanup
+        const conn = NamedSocket.init(self.allocator, self.io);
+        conn.accept(client_fd);
+        // the delegate is responsible for the NamedSocket ownership/cleanup
         self.delegate.onAccept(conn);
 
         self.armAccept() catch {
-            std.log.err("NamedServerSocketConnection IO.accept: failed to schedule accept", .{});
+            std.log.err("NamedServerSocket IO.accept: failed to schedule accept", .{});
             return;
         };
     }
@@ -282,9 +356,27 @@ pub const NamedSocketDelegate = struct {
     vtable: *const VTable,
 
     pub const VTable = struct {
+        onConnection: *const fn (ptr: *anyopaque) void,
+        onConnectionFailed: *const fn (ptr: *anyopaque, err: IO.ConnectError) void,
+        onDisconnect: *const fn (ptr: *anyopaque) void,
         onClose: *const fn (ptr: *anyopaque) void,
         onRecv: *const fn (ptr: *anyopaque, buffer: *IOBuffer) void,
+        onRecvFailed: *const fn (ptr: *anyopaque, err: IO.RecvError) void,
+        onSend: *const fn (ptr: *anyopaque, sent: usize) void,
+        onSendFailed: *const fn (ptr: *anyopaque, err: IO.SendError) void,
     };
+
+    pub fn onConnection(self: NamedSocketDelegate) void {
+        self.vtable.onConnection(self.ptr);
+    }
+
+    pub fn onConnectionFailed(self: NamedSocketDelegate, err: IO.ConnectError) void {
+        self.vtable.onConnectionFailed(self.ptr, err);
+    }
+
+    pub fn onDisconnect(self: NamedSocketDelegate) void {
+        self.vtable.onDisconnect(self.ptr);
+    }
 
     pub fn onClose(self: NamedSocketDelegate) void {
         self.vtable.onClose(self.ptr);
@@ -292,6 +384,18 @@ pub const NamedSocketDelegate = struct {
 
     pub fn onRecv(self: NamedSocketDelegate, buffer: *IOBuffer) void {
         self.vtable.onRecv(self.ptr, buffer);
+    }
+
+    pub fn onRecvFailed(self: NamedSocketDelegate, err: IO.RecvError) void {
+        self.vtable.onRecvFailed(self.ptr, err);
+    }
+
+    pub fn onSend(self: NamedSocketDelegate, sent: usize) void {
+        self.vtable.onSend(self.ptr, sent);
+    }
+
+    pub fn onSendFailed(self: NamedSocketDelegate, err: IO.SendError) void {
+        self.vtable.onSendFailed(self.ptr, err);
     }
 };
 
@@ -301,14 +405,30 @@ pub const NamedServerSocketDelegate = struct {
 
     pub const VTable = struct {
         onClose: *const fn (ptr: *anyopaque) void,
-        onAccept: *const fn (ptr: *anyopaque, socket: *NamedSocketConnection) void,
+        onAccept: *const fn (ptr: *anyopaque, socket: *NamedSocket) void,
     };
 
     pub fn onClose(self: NamedServerSocketDelegate) void {
         self.vtable.onClose(self.ptr);
     }
 
-    pub fn onAccept(self: NamedServerSocketDelegate, socket: *NamedSocketConnection) void {
+    pub fn onAccept(self: NamedServerSocketDelegate, socket: *NamedSocket) void {
         self.vtable.onAccept(self.ptr, socket);
     }
 };
+
+fn onDataCompletionLinux(ctx: ?*anyopaque, _: *IO.Completion, result: *const anyopaque) void {
+    std.debug.print("OnDataCompletion: doing nothing here, just asserting it was called", .{});
+    _ = ctx;
+    _ = result;
+}
+
+fn onDataCompletionDarwin(_: *IO, _: *IO.Completion) void {
+    std.debug.print("OnDataCompletion: doing nothing here, just asserting it was called", .{});
+}
+
+fn onConnectCompletion(ctx: ?*anyopaque, _: *IO.Completion, result: *const anyopaque) void {
+    std.debug.print("OnConnectCompletion: doing nothing here, just asserting it was called", .{});
+    _ = ctx;
+    _ = result;
+}

@@ -61,7 +61,7 @@ pub const RunLoop = struct {
     }
 };
 
-const ShutdownTask = struct {
+pub const ShutdownTask = struct {
     task: Task,
     node: TaskQueue.Node = .{ .value = undefined },
     allocator: std.mem.Allocator,
@@ -69,7 +69,7 @@ const ShutdownTask = struct {
 
     fn callback(task: *Task) void {
         const self: *ShutdownTask = @fieldParentPtr("task", task);
-        std.log.info("Shutting down", .{});
+        std.log.info("shutting down", .{});
         self.runloop.quit();
         self.allocator.destroy(self);
     }

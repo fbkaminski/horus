@@ -22,6 +22,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const base = @import("../core/base.zig");
+const platform_file = @import("platform.zig");
 const thread_file = @import("../core/single_thread_task_runner.zig");
 const thread_registry_file = @import("../core/thread_registry.zig");
 const work_queue = @import("../core/work_queue.zig");
@@ -37,6 +38,7 @@ const ThreadRegistry = thread_registry_file.ThreadRegistry;
 const Task = base.Task;
 const TaskQueue = base.TaskQueue;
 
+const Platform = platform_file.Platform;
 const ServiceHandle = service_file.ServiceHandle;
 const ServiceId = service_file.ServiceId;
 const CapToken = service_file.CapToken;
@@ -65,12 +67,14 @@ pub const ServiceManager = struct {
     state: ServiceManagerState,
     clients: ClientContextPool,
     server_delegate: ChannelListenerDelegate,
+    shutting_down: bool,
 
     pub fn init(self: *ServiceManager, allocator: std.mem.Allocator, thread_registry: *ThreadRegistry) !void {
         self.allocator = allocator;
         self.services = .init(allocator);
         self.last_service_id = 1000;
         self.state = .init;
+        self.shutting_down = false;
         self.clients = try ClientContextPool.init(allocator);
         self.server_delegate = .{
             .ptr = self,
@@ -80,7 +84,7 @@ pub const ServiceManager = struct {
         try self.server_channel.init(allocator, SERVICE_MANAGER_SOCKET_PATH, &self.task_runner.io, &self.server_delegate);
     }
 
-    pub fn spawn(self: *ServiceManager) !void {
+    pub fn start(self: *ServiceManager) !void {
         try self.task_runner.start(
             spawnOnThread,
             self,
@@ -139,13 +143,17 @@ pub const ServiceManager = struct {
 
     fn onServerChannelClosed(self: *ServiceManager, server: *ChannelListener) void {
         std.log.info("ServiceManager.onServerChannelClosed: server closed the connection", .{});
-        _ = self;
         _ = server;
+        _ = self;
     }
 
     fn onContextDone(self: *ServiceManager, client_context: *ClientContext) void {
         std.debug.assert(self.clients.removeClient(client_context));
         client_context.deinit(self.allocator);
+        if (self.shutting_down) {
+            const platform = Platform.get();
+            if (platform) |p| p.shutdown() catch return;
+        }
     }
 
     const delegate_vtable = ChannelListenerDelegate.VTable{
@@ -202,10 +210,41 @@ const ClientContext = struct {
     }
 
     pub fn deinit(self: *ClientContext, allocator: std.mem.Allocator) void {
+        self.channel.setDelegate(null);
+        self.channel.deinit();
         allocator.destroy(self);
     }
 
-    fn onDataAvailable(self: *ClientContext, client: *Channel, buffer: *IOBuffer) void {
+    fn onConnection(self: *ClientContext, client: *Channel) void {
+        _ = self;
+        _ = client;
+        std.log.info("ClientContext.onConnection: connected.", .{});
+    }
+
+    fn onConnectionFailed(self: *ClientContext, client: *Channel, err: IO.ConnectError) void {
+        _ = self;
+        _ = client;
+        std.log.info("ClientContext.onConnectionFailed: {}.", .{err});
+    }
+
+    fn onDisconnect(self: *ClientContext, client: *Channel) void {
+        _ = self;
+        _ = client;
+        std.log.info("ClientContext.onDisconnect: client connection disconnected by the remote peer.", .{});
+    }
+
+    fn onConnectionClosed(self: *ClientContext, client: *Channel) void {
+        std.debug.assert(self.task_runner.isCurrentThread());
+        //std.debug.assert(client == self.channel);
+        std.log.info("Service manager: client connection closed.", .{});
+        //var named_client: *NamedProcessChannel = @ptrCast(client);
+        //named_client.deinit();
+        // this will clean ourselves
+        self.service_manager.onContextDone(self);
+        _ = client;
+    }
+
+    fn onReceive(self: *ClientContext, client: *Channel, buffer: *IOBuffer) void {
         _ = client;
         std.debug.assert(self.task_runner.isCurrentThread());
         //std.debug.assert(client == self.channel);
@@ -213,39 +252,90 @@ const ClientContext = struct {
         self.task_runner.postTaskTo(.workers, &self.read_cb.node);
     }
 
-    fn onConnectionClosed(self: *ClientContext, client: *Channel) void {
+    fn onReceiveFailed(self: *ClientContext, client: *Channel, err: IO.RecvError) void {
+        _ = self;
         _ = client;
-        std.debug.assert(self.task_runner.isCurrentThread());
-        //std.debug.assert(client == self.channel);
-        std.log.info("ClientContext.onConnectionClosed: client connection closed.", .{});
+        std.log.info("ClientContext.onReceiveFailed: {}", .{err});
+    }
+
+    fn onSend(self: *ClientContext, client: *Channel, sent: usize) void {
+        _ = self;
+        _ = client;
+        std.log.info("ClientContext.onSend: sent {d} bytes", .{sent});
+    }
+
+    fn onSendFailed(self: *ClientContext, client: *Channel, err: IO.SendError) void {
+        _ = self;
+        _ = client;
+        std.log.info("ClientContext.onSendFailed: {}", .{err});
     }
 
     fn processIncomingDataOnWorkerThread(self: *ClientContext, buffer: *IOBuffer) void {
         // we will use the buffer here
-        std.log.info("ClientContext.processIncomingDataOnWorkerThread: processing message \"{s}\" on task_runner {d}", .{ buffer.readable(), std.Thread.getCurrentId() });
+        std.log.info("Service manager: processing \"{s}\" on {d}", .{ buffer.readable(), std.Thread.getCurrentId() });
+        const message = self.read_cb.buffer.?.readable();
+        const is_shutdown = (std.mem.eql(u8, message, "SHUTDOWN"));
+        if (is_shutdown) {
+            self.service_manager.shutting_down = true;
+        }
         self.task_runner.postTaskTo(.service, &self.read_cb.response_node);
     }
 
     fn processIncomingDataReplyOnServiceThread(self: *ClientContext, client: *NamedProcessChannel) void {
         std.debug.assert(self.task_runner.isCurrentThread());
-        std.log.info("ClientContext.processIncomingDataReplyOnServiceThread: response after readDataOnWorkerThread on task_runner {d}\n", .{std.Thread.getCurrentId()});
-        client.deinit();
-        // this will clean ourselves
-        self.service_manager.onContextDone(self);
+        std.log.info("Service manager: processing response on {d}\n", .{std.Thread.getCurrentId()});
+
+        if (self.read_cb.buffer) |buf| buf.unref();
+        _ = client;
     }
 
     const delegate_vtable = ChannelDelegate.VTable{
-        .onDataAvailable = struct {
-            fn f(ptr: *anyopaque, channel: *Channel, buffer: *IOBuffer) void {
+        .onConnection = struct {
+            fn f(ptr: *anyopaque, channel: *Channel) void {
                 const self: *ClientContext = @ptrCast(@alignCast(ptr));
-                self.onDataAvailable(channel, buffer);
-                buffer.unref();
+                self.onConnection(channel);
+            }
+        }.f,
+        .onConnectionFailed = struct {
+            fn f(ptr: *anyopaque, channel: *Channel, err: IO.ConnectError) void {
+                const self: *ClientContext = @ptrCast(@alignCast(ptr));
+                self.onConnectionFailed(channel, err);
             }
         }.f,
         .onConnectionClosed = struct {
             fn f(ptr: *anyopaque, channel: *Channel) void {
                 const self: *ClientContext = @ptrCast(@alignCast(ptr));
                 self.onConnectionClosed(channel);
+            }
+        }.f,
+        .onDisconnect = struct {
+            fn f(ptr: *anyopaque, channel: *Channel) void {
+                const self: *ClientContext = @ptrCast(@alignCast(ptr));
+                self.onDisconnect(channel);
+            }
+        }.f,
+        .onReceive = struct {
+            fn f(ptr: *anyopaque, channel: *Channel, buffer: *IOBuffer) void {
+                const self: *ClientContext = @ptrCast(@alignCast(ptr));
+                self.onReceive(channel, buffer);
+            }
+        }.f,
+        .onReceiveFailed = struct {
+            fn f(ptr: *anyopaque, channel: *Channel, err: IO.RecvError) void {
+                const self: *ClientContext = @ptrCast(@alignCast(ptr));
+                self.onReceiveFailed(channel, err);
+            }
+        }.f,
+        .onSend = struct {
+            fn f(ptr: *anyopaque, channel: *Channel, sent: usize) void {
+                const self: *ClientContext = @ptrCast(@alignCast(ptr));
+                self.onSend(channel, sent);
+            }
+        }.f,
+        .onSendFailed = struct {
+            fn f(ptr: *anyopaque, channel: *Channel, err: IO.SendError) void {
+                const self: *ClientContext = @ptrCast(@alignCast(ptr));
+                self.onSendFailed(channel, err);
             }
         }.f,
     };
