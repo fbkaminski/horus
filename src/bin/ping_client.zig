@@ -27,9 +27,7 @@ pub fn main() !void {
     defer main_thread.deinit();
 
     var runloop = RunLoop.init(main_thread.runloop_delegate());
-
     const quit_closure = try runloop.quitClosure(alloc);
-
     const ping_callback = try PingTask.init(alloc, &main_thread, quit_closure);
 
     // first ping on in 1 second
@@ -140,7 +138,6 @@ const PingTask = struct {
     fn onConnectionFailed(self: *PingTask, err: IO.ConnectError) void {
         std.log.info("PingTask.onConnectionFailed: {} => exiting now!", .{err});
         self.task_runner.postTask(&self.shutdown_task.node);
-        //self.task_runner.postDelayedTask(5000 * std.time.ns_per_ms, &self.shutdown_task.node);
     }
 
     fn onDisconnect(self: *PingTask) void {
@@ -155,8 +152,7 @@ const PingTask = struct {
 
     fn onReceive(self: *PingTask, buffer: *IOBuffer) void {
         _ = self;
-        _ = buffer;
-        std.log.info("PingTask.onReceive", .{});
+        std.log.info("received '{s}'", .{buffer.readable()});
     }
 
     fn onReceiveFailed(self: *PingTask, err: IO.RecvError) void {

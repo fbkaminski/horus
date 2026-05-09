@@ -178,12 +178,16 @@ const ClientContext = struct {
     task_runner: *SingleThreadTaskRunner,
     channel: *NamedProcessChannel,
     read_cb: ReadCallback,
+    write_buffer: *IOBuffer,
     delegate: ChannelDelegate,
+    // a silly way of measuring pings
+    ping: usize,
 
     pub fn init(self: *ClientContext, manager: *ServiceManager, task_runner: *SingleThreadTaskRunner, channel: *NamedProcessChannel) void {
         self.service_manager = manager;
         self.task_runner = task_runner;
         self.channel = channel;
+        self.ping = 0;
         self.delegate = .{
             .ptr = self,
             .vtable = &delegate_vtable,
@@ -207,10 +211,12 @@ const ClientContext = struct {
         };
         // define ourselves as the delegate of the client channel
         self.channel.setDelegate(&self.delegate);
+        self.write_buffer = self.channel.connection.buffer_pool.acquire() catch return;
     }
 
     pub fn deinit(self: *ClientContext, allocator: std.mem.Allocator) void {
         self.channel.setDelegate(null);
+        self.write_buffer.unref();
         self.channel.deinit();
         allocator.destroy(self);
     }
@@ -273,9 +279,15 @@ const ClientContext = struct {
     fn processIncomingDataOnWorkerThread(self: *ClientContext, buffer: *IOBuffer) void {
         // we will use the buffer here
         std.log.info("Service manager: processing \"{s}\" on {d}", .{ buffer.readable(), std.Thread.getCurrentId() });
+        // Note: here we are just testing things for now
+        // and adjusting the socket lifetime
+        // thats why this looks lame as of now :)
         const message = self.read_cb.buffer.?.readable();
         const is_shutdown = (std.mem.eql(u8, message, "SHUTDOWN"));
-        if (is_shutdown) {
+        const is_ping = (std.mem.eql(u8, message, "PING"));
+        if (is_ping) {
+            self.ping += 1;
+        } else if (is_shutdown) {
             self.service_manager.shutting_down = true;
         }
         self.task_runner.postTaskTo(.service, &self.read_cb.response_node);
@@ -284,9 +296,12 @@ const ClientContext = struct {
     fn processIncomingDataReplyOnServiceThread(self: *ClientContext, client: *NamedProcessChannel) void {
         std.debug.assert(self.task_runner.isCurrentThread());
         std.log.info("Service manager: processing response on {d}\n", .{std.Thread.getCurrentId()});
-
+        if (self.write_buffer.write_pos == 0) {
+            @memcpy(self.write_buffer.writable()[0..4], "PONG");
+            self.write_buffer.advance_write(4);
+        }
+        client.connection.send(self.write_buffer);
         if (self.read_cb.buffer) |buf| buf.unref();
-        _ = client;
     }
 
     const delegate_vtable = ChannelDelegate.VTable{

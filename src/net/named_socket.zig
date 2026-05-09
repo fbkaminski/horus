@@ -149,6 +149,8 @@ pub const NamedSocket = struct {
                 .callback = onDataCompletionDarwin,
             };
         }
+        // allocate the recv buffer
+        self.recv_buf = self.buffer_pool.acquire() catch return;
         // arm the first recv after being sucessfully connected
         self.armRecv();
     }
@@ -179,6 +181,10 @@ pub const NamedSocket = struct {
         };
         self.state = .open;
         if (self.delegate) |d| d.onConnection();
+
+        // allocate the recv buffer
+        self.recv_buf = self.buffer_pool.acquire() catch return;
+
         // arm the first recv after being sucessfully connected
         self.armRecv();
         self.decrementPendingOps();
@@ -224,14 +230,12 @@ pub const NamedSocket = struct {
             buf.advance_write(n);
             if (self.delegate) |d| d.onRecv(buf);
         }
-        self.recv_buf = null;
         self.armRecv();
     }
 
     fn armRecv(self: *NamedSocket) void {
         if (self.state != .open) return;
 
-        self.recv_buf = self.buffer_pool.acquire() catch return;
         self.io.recv(
             *NamedSocket,
             self,
@@ -262,14 +266,22 @@ pub const NamedSocket = struct {
     }
 };
 
-// TODO: we need a state-machine here too
+const ServerConnectionState = enum {
+    init,
+    opening,
+    open,
+    listening,
+    closing,
+    closed,
+};
+
 pub const NamedServerSocket = struct {
     allocator: std.mem.Allocator,
     delegate: *NamedServerSocketDelegate,
     io: *IO,
     socket: std.posix.fd_t,
     path: []const u8,
-    closed: bool,
+    state: ServerConnectionState,
     accept_completion: IO.Completion,
 
     pub fn create(allocator: std.mem.Allocator, delegate: *NamedServerSocketDelegate, io: *IO, path: []const u8) !NamedServerSocket {
@@ -289,7 +301,7 @@ pub const NamedServerSocket = struct {
             .io = io,
             .socket = socket,
             .path = path,
-            .closed = false,
+            .state = .open,
             .accept_completion = undefined,
         };
     }
@@ -299,11 +311,11 @@ pub const NamedServerSocket = struct {
     }
 
     pub fn close(self: *NamedServerSocket) void {
-        if (!self.closed) {
-            std.posix.close(self.socket);
-            self.closed = true;
-            self.delegate.onClose();
-        }
+        if (self.state == .closed) return;
+
+        std.posix.close(self.socket);
+        self.state = .closed;
+        self.delegate.onClose();
     }
 
     pub fn listen(self: *NamedServerSocket) !void {
@@ -316,6 +328,7 @@ pub const NamedServerSocket = struct {
 
         try std.posix.bind(self.socket, @ptrCast(&addr), @sizeOf(std.posix.sockaddr.un));
         try std.posix.listen(self.socket, 16);
+        self.state = .listening;
         try self.armAccept();
     }
 
