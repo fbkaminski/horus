@@ -1,24 +1,3 @@
-// Minimal First Implementation
-// Step 1 — The bootstrap socket listener
-//  Add an io_uring accept loop in the service manager for the Unix socket.
-//  Each accepted connection becomes a Connection tracked in the ServiceTable.
-//  This is just another fd in your existing io_uring event loop — IORING_OP_ACCEPT on the socket,
-//  then IORING_OP_RECV on each client fd.
-// Step 2 — Register/Resolve messages
-//  Define the wire format for RegisterService and ResolveHandle —
-//  a simple fixed-header struct is enough at first, no IDL needed yet.
-//  The service manager processes these as regular messages dispatched through the RunLoop.
-// Step 3 — Handle introduction via SCM_RIGHTS
-//  When ResolveHandle is processed, socketpair(AF_UNIX, SOCK_SEQPACKET),
-//  send one fd back to the caller via sendmsg with SCM_RIGHTS,
-//  store the other end in the ServiceEntry.
-//  SOCK_SEQPACKET is the right socket type here —
-//  message boundaries preserved, ordered delivery, no partial reads, unlike SOCK_STREAM.
-// Step 4 — Wire a test service
-//  Register a trivial service (a ping responder) from a separate process,
-//  resolve it from a third process, exchange a message directly over the introduced channel.
-//  At that point the core mechanism is proven.
-
 const std = @import("std");
 const builtin = @import("builtin");
 const base = @import("../core/base.zig");
@@ -282,26 +261,28 @@ const ClientContext = struct {
         // Note: here we are just testing things for now
         // and adjusting the socket lifetime
         // thats why this looks lame as of now :)
-        const message = self.read_cb.buffer.?.readable();
+        const message = buffer.readable();
         const is_shutdown = (std.mem.eql(u8, message, "SHUTDOWN"));
-        const is_ping = (std.mem.eql(u8, message, "PING"));
+        const is_ping = (std.mem.startsWith(u8, message, "PING"));
         if (is_ping) {
             self.ping += 1;
         } else if (is_shutdown) {
             self.service_manager.shutting_down = true;
         }
+        buffer.unref();
         self.task_runner.postTaskTo(.service, &self.read_cb.response_node);
     }
 
     fn processIncomingDataReplyOnServiceThread(self: *ClientContext, client: *NamedProcessChannel) void {
         std.debug.assert(self.task_runner.isCurrentThread());
         std.log.info("Service manager: processing response on {d}\n", .{std.Thread.getCurrentId()});
-        if (self.write_buffer.write_pos == 0) {
+        if (self.ping > 0) {
+            self.write_buffer.write_pos = 0;
             @memcpy(self.write_buffer.writable()[0..4], "PONG");
             self.write_buffer.advance_write(4);
+            client.connection.send(self.write_buffer);
+            self.ping -= 1;
         }
-        client.connection.send(self.write_buffer);
-        if (self.read_cb.buffer) |buf| buf.unref();
     }
 
     const delegate_vtable = ChannelDelegate.VTable{

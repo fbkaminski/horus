@@ -55,7 +55,7 @@ pub const NamedSocket = struct {
         const address = try std.net.Address.initUnix(path);
         const sock = try std.posix.socket(
             std.posix.AF.UNIX,
-            std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC,
+            std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC | std.posix.SOCK.NONBLOCK,
             0,
         );
         self.socket = sock;
@@ -204,7 +204,6 @@ pub const NamedSocket = struct {
             if (self.delegate) |d| d.onSendFailed(e);
             return;
         };
-        //std.log.info("send completion: wrote {} bytes", .{size});
         if (self.delegate) |d| d.onSend(size);
         self.decrementPendingOps();
     }
@@ -228,13 +227,17 @@ pub const NamedSocket = struct {
         }
         if (self.recv_buf) |buf| {
             buf.advance_write(n);
-            if (self.delegate) |d| d.onRecv(buf);
+            const cloned = self.buffer_pool.acquire() catch return;
+            buf.copy(cloned);
+            if (self.delegate) |d| d.onRecv(cloned);
         }
         self.armRecv();
     }
 
     fn armRecv(self: *NamedSocket) void {
         if (self.state != .open) return;
+
+        self.recv_buf.?.write_pos = 0;
 
         self.io.recv(
             *NamedSocket,

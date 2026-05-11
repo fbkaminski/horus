@@ -3,7 +3,7 @@ const std = @import("std");
 pub const IOBufferPool = struct {
     allocator: std.mem.Allocator,
     block_size: usize,
-    free_list: ?*IOBuffer, // intrusive: IOBuffer.next_free
+    free_list: ?*IOBuffer,
     free_count: usize,
     max_free: usize,
     in_use: usize,
@@ -37,17 +37,14 @@ pub const IOBufferPool = struct {
 
     pub fn acquire(self: *IOBufferPool) !*IOBuffer {
         const buf = if (self.free_list) |head| blk: {
-            // Freelist hit: pop the head.
             self.free_list = head.next_free;
             self.free_count -= 1;
             head.next_free = null;
             head.write_pos = 0;
             head.read_pos = 0;
-            // ref_count was zero in the freelist; bring it to 1.
             head.ref_count.store(1, .release);
             break :blk head;
         } else blk: {
-            // Freelist miss: allocate.
             const new_buf = try self.allocator.create(IOBuffer);
             errdefer self.allocator.destroy(new_buf);
             const data = try self.allocator.alloc(u8, self.block_size);
@@ -74,13 +71,11 @@ pub const IOBufferPool = struct {
         self.in_use -= 1;
 
         if (self.free_count >= self.max_free) {
-            // Freelist is full; free this buffer rather than holding it.
             self.allocator.free(buf.data[0..buf.capacity]);
             self.allocator.destroy(buf);
             return;
         }
 
-        // Push at the head — O(1), LIFO (cache-friendly).
         buf.next_free = self.free_list;
         self.free_list = buf;
         self.free_count += 1;
@@ -89,7 +84,7 @@ pub const IOBufferPool = struct {
 
 pub const IOBuffer = struct {
     pool: *IOBufferPool,
-    next_free: ?*IOBuffer, // freelist link for IOBufferPool
+    next_free: ?*IOBuffer,
     capacity: usize,
     write_pos: usize,
     read_pos: usize,
@@ -121,8 +116,16 @@ pub const IOBuffer = struct {
         std.debug.assert(self.write_pos + n <= self.capacity);
         self.write_pos += n;
     }
+
     pub fn advance_read(self: *IOBuffer, n: usize) void {
         std.debug.assert(self.read_pos + n <= self.write_pos);
         self.read_pos += n;
+    }
+
+    // returns a copy of the given buffer
+    pub fn copy(self: *IOBuffer, copy_to: *IOBuffer) void {
+        copy_to.write_pos = self.write_pos;
+        copy_to.read_pos = self.read_pos;
+        @memcpy(copy_to.data[self.read_pos..self.write_pos], self.data[self.read_pos..self.write_pos]);
     }
 };

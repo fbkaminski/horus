@@ -38,6 +38,8 @@ pub fn main() !void {
     ping_callback.deinit(alloc);
 }
 
+const MAX_PINGS = 4;
+
 const PingTask = struct {
     allocator: std.mem.Allocator,
     task: Task,
@@ -119,7 +121,7 @@ const PingTask = struct {
     }
 
     fn loadBuffer(self: *PingTask, buf: *IOBuffer) void {
-        const message = if (self.pings < 49) std.fmt.bufPrint(&self.sbuf, "PING {d}", .{self.pings + 1}) catch return else std.fmt.bufPrint(&self.sbuf, "SHUTDOWN", .{}) catch return;
+        const message = if (self.pings < MAX_PINGS - 1) std.fmt.bufPrint(&self.sbuf, "PING {d}", .{self.pings + 1}) catch return else std.fmt.bufPrint(&self.sbuf, "SHUTDOWN", .{}) catch return;
         //const message = std.fmt.bufPrint(&self.sbuf, "PING {d}", .{self.pings + 1}) catch return;
         buf.write_pos = 0;
         var writer = std.io.Writer.fixed(buf.writable());
@@ -153,6 +155,7 @@ const PingTask = struct {
     fn onReceive(self: *PingTask, buffer: *IOBuffer) void {
         _ = self;
         std.log.info("received '{s}'", .{buffer.readable()});
+        buffer.unref();
     }
 
     fn onReceiveFailed(self: *PingTask, err: IO.RecvError) void {
@@ -162,7 +165,7 @@ const PingTask = struct {
 
     fn onSend(self: *PingTask, _: usize) void {
         self.pings += 1;
-        if (self.pings < 50) {
+        if (self.pings < MAX_PINGS) {
             self.task_runner.postDelayedTask(300 * std.time.ns_per_ms, &self.node);
         } else {
             self.task_runner.postDelayedTask(300 * std.time.ns_per_ms, &self.shutdown_task.node);
