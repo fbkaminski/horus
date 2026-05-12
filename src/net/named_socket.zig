@@ -23,7 +23,7 @@ pub const NamedSocket = struct {
     cancel_completion: IO.Completion,
     connect_completion: IO.Completion,
     write_completion: IO.Completion,
-    recv_buf: ?*IOBuffer,
+    recv_buf: *IOBuffer,
     write_buf: ?*IOBuffer,
     buffer_pool: IOBufferPool,
     state: ConnectionState,
@@ -37,9 +37,9 @@ pub const NamedSocket = struct {
         self.delegate = null;
         self.io = io;
         self.socket = null;
-        self.recv_buf = null;
         self.write_buf = null;
         self.buffer_pool = IOBufferPool.init(allocator, .{});
+        self.recv_buf = self.buffer_pool.acquire() catch return undefined;
         self.state = .init;
         self.pending_ops = 0;
         if (builtin.os.tag == .linux) {
@@ -149,8 +149,6 @@ pub const NamedSocket = struct {
                 .callback = onDataCompletionDarwin,
             };
         }
-        // allocate the recv buffer
-        self.recv_buf = self.buffer_pool.acquire() catch return;
         // arm the first recv after being sucessfully connected
         self.armRecv();
     }
@@ -181,9 +179,6 @@ pub const NamedSocket = struct {
         };
         self.state = .open;
         if (self.delegate) |d| d.onConnection();
-
-        // allocate the recv buffer
-        self.recv_buf = self.buffer_pool.acquire() catch return;
 
         // arm the first recv after being sucessfully connected
         self.armRecv();
@@ -225,19 +220,17 @@ pub const NamedSocket = struct {
             self.close();
             return;
         }
-        if (self.recv_buf) |buf| {
-            buf.advance_write(n);
-            const cloned = self.buffer_pool.acquire() catch return;
-            buf.copy(cloned);
-            if (self.delegate) |d| d.onRecv(cloned);
-        }
+        self.recv_buf.advance_write(n);
+        const cloned = self.buffer_pool.acquire() catch return;
+        self.recv_buf.copy(cloned);
+        if (self.delegate) |d| d.onRecv(cloned);
         self.armRecv();
     }
 
     fn armRecv(self: *NamedSocket) void {
         if (self.state != .open) return;
 
-        self.recv_buf.?.write_pos = 0;
+        self.recv_buf.write_pos = 0;
 
         self.io.recv(
             *NamedSocket,
@@ -245,16 +238,13 @@ pub const NamedSocket = struct {
             onRecv,
             &self.recv_completion,
             self.socket.?,
-            self.recv_buf.?.writable(),
+            self.recv_buf.writable(),
         );
         self.incrementPendingOps();
     }
 
     fn finalize(self: *NamedSocket) void {
-        if (self.recv_buf) |buf| {
-            buf.unref();
-            self.recv_buf = null;
-        }
+        self.recv_buf.unref();
         self.buffer_pool.deinit();
         self.allocator.destroy(self);
     }

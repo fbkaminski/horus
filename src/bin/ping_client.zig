@@ -38,7 +38,7 @@ pub fn main() !void {
     ping_callback.deinit(alloc);
 }
 
-const MAX_PINGS = 4;
+const MAX_PINGS = 12;
 
 const PingTask = struct {
     allocator: std.mem.Allocator,

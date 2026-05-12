@@ -75,9 +75,9 @@ pub const ServiceManager = struct {
     }
 
     pub fn deinit(self: *ServiceManager) void {
+        self.clients.deinit();
         self.server_channel.close();
         self.task_runner.deinit();
-        self.clients.deinit();
     }
 
     // register a new service and return the Service handler
@@ -128,7 +128,7 @@ pub const ServiceManager = struct {
 
     fn onContextDone(self: *ServiceManager, client_context: *ClientContext) void {
         std.debug.assert(self.clients.removeClient(client_context));
-        client_context.deinit(self.allocator);
+        //client_context.deinit(self.allocator);
         if (self.shutting_down) {
             const platform = Platform.get();
             if (platform) |p| p.shutdown() catch return;
@@ -153,6 +153,7 @@ pub const ServiceManager = struct {
 };
 
 const ClientContext = struct {
+    allocator: std.mem.Allocator,
     service_manager: *ServiceManager,
     task_runner: *SingleThreadTaskRunner,
     channel: *NamedProcessChannel,
@@ -164,6 +165,7 @@ const ClientContext = struct {
 
     pub fn init(self: *ClientContext, manager: *ServiceManager, task_runner: *SingleThreadTaskRunner, channel: *NamedProcessChannel) void {
         self.service_manager = manager;
+        self.allocator = self.service_manager.allocator;
         self.task_runner = task_runner;
         self.channel = channel;
         self.ping = 0;
@@ -193,11 +195,12 @@ const ClientContext = struct {
         self.write_buffer = self.channel.connection.buffer_pool.acquire() catch return;
     }
 
-    pub fn deinit(self: *ClientContext, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: *ClientContext) void {
+        self.service_manager.onContextDone(self);
         self.channel.setDelegate(null);
         self.write_buffer.unref();
         self.channel.deinit();
-        allocator.destroy(self);
+        self.allocator.destroy(self);
     }
 
     fn onConnection(self: *ClientContext, client: *Channel) void {
@@ -223,9 +226,9 @@ const ClientContext = struct {
         //std.debug.assert(client == self.channel);
         std.log.info("Service manager: client connection closed.", .{});
         //var named_client: *NamedProcessChannel = @ptrCast(client);
-        //named_client.deinit();
-        // this will clean ourselves
-        self.service_manager.onContextDone(self);
+        // named_client.deinit();
+        // clean ourselves
+        self.deinit();
         _ = client;
     }
 
@@ -369,6 +372,9 @@ const ClientContextPool = struct {
     }
 
     pub fn deinit(self: *ClientContextPool) void {
+        for (self.clients.items) |client| {
+            client.deinit();
+        }
         self.clients.deinit(self.allocator);
     }
 
