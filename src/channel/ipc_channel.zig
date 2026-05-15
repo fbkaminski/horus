@@ -3,10 +3,10 @@ const std = @import("std");
 const channel_file = @import("channel.zig");
 const base = @import("../core/base.zig");
 const frame_file = @import("frame.zig");
+const socket_file = @import("../net/socket.zig");
 const named_socket = @import("../net/named_socket.zig");
 const io_buffer = @import("../net/io_buffer.zig");
-const io_file = if (builtin.os.tag == .linux) @import("../io/linux.zig") else @import("../io/darwin.zig");
-const IO = io_file.IO;
+const IO = @import("../io/io.zig").IO;
 const Channel = channel_file.Channel;
 const ChannelListener = channel_file.ChannelListener;
 const ChannelMode = channel_file.ChannelMode;
@@ -16,21 +16,23 @@ const Task = base.Task;
 const TaskQueue = base.TaskQueue;
 const NamedSocket = named_socket.NamedSocket;
 const NamedServerSocket = named_socket.NamedServerSocket;
-const NamedServerSocketDelegate = named_socket.NamedServerSocketDelegate;
-const NamedSocketDelegate = named_socket.NamedSocketDelegate;
+const Socket = socket_file.Socket;
+const ServerSocketDelegate = socket_file.ServerSocketDelegate;
+const SocketDelegate = socket_file.SocketDelegate;
 const Frame = frame_file.Frame;
 const IOBuffer = io_buffer.IOBuffer;
+const IOBufferPool = io_buffer.IOBufferPool;
 
-/// A Named process server (named unix socket backed)
-pub const NamedProcessServerChannel = struct {
+/// IpcChannel/IpcServerChannel over a Socket/ServerSocket => (Named or Threaded)
+pub const IpcServerChannel = struct {
     // the base channel
     base: ChannelListener,
     allocator: std.mem.Allocator,
-    connection: NamedServerSocket,
-    socket_delegate: NamedServerSocketDelegate,
+    connection: *NamedServerSocket,
+    socket_delegate: ServerSocketDelegate,
     delegate: *ChannelListenerDelegate,
 
-    pub fn init(self: *NamedProcessServerChannel, allocator: std.mem.Allocator, path: []const u8, io: *IO, delegate: *ChannelListenerDelegate) !void {
+    pub fn init(self: *IpcServerChannel, allocator: std.mem.Allocator, io: *IO, pool: *IOBufferPool, delegate: *ChannelListenerDelegate) !void {
         self.allocator = allocator;
         self.delegate = delegate;
         self.base = .{
@@ -41,77 +43,81 @@ pub const NamedProcessServerChannel = struct {
             .ptr = self,
             .vtable = &socket_delegate_vtable,
         };
-        self.connection = try NamedServerSocket.create(allocator, &self.socket_delegate, io, path);
+        self.connection = try allocator.create(NamedServerSocket);
+        self.connection.init(allocator, &self.socket_delegate, io, pool);
     }
 
-    pub fn serve(self: *NamedProcessServerChannel) !void {
-        try self.connection.listen();
+    pub fn deinit(self: *IpcServerChannel) void {
+        self.connection.deinit();
     }
 
-    pub fn channel(self: *NamedProcessServerChannel) *ChannelListener {
+    pub fn serve(self: *IpcServerChannel, path: []const u8) void {
+        self.connection.listen(.{ .path = path });
+    }
+
+    pub fn channel(self: *IpcServerChannel) *ChannelListener {
         return &self.base;
     }
 
-    pub fn mode(self: *NamedProcessServerChannel) ChannelMode {
+    pub fn mode(self: *IpcServerChannel) ChannelMode {
         _ = self;
         return .SERVER;
     }
-    pub fn close(self: *NamedProcessServerChannel) void {
+    pub fn close(self: *IpcServerChannel) void {
         self.connection.close();
     }
 
     const listener_channel_vtable = ChannelListener.VTable{
         .mode = struct {
             fn f(ptr: *anyopaque) ChannelMode {
-                const self: *NamedProcessServerChannel = @ptrCast(@alignCast(ptr));
+                const self: *IpcServerChannel = @ptrCast(@alignCast(ptr));
                 return self.mode();
             }
         }.f,
         .close = struct {
             fn f(ptr: *anyopaque) void {
-                const self: *NamedProcessServerChannel = @ptrCast(@alignCast(ptr));
+                const self: *IpcServerChannel = @ptrCast(@alignCast(ptr));
                 self.close();
             }
         }.f,
         .listen = struct {
-            fn f(ptr: *anyopaque) void {
-                const self: *NamedProcessServerChannel = @ptrCast(@alignCast(ptr));
-                // fixme: dont ignore errors here (how to broadcast forward)
-                self.serve() catch return;
+            fn f(ptr: *anyopaque, path: []const u8) void {
+                const self: *IpcServerChannel = @ptrCast(@alignCast(ptr));
+                self.serve(path);
             }
         }.f,
     };
 
-    const socket_delegate_vtable = NamedServerSocketDelegate.VTable{
+    const socket_delegate_vtable = ServerSocketDelegate.VTable{
         .onAccept = struct {
-            fn f(ptr: *anyopaque, socket: *NamedSocket) void {
-                const self: *NamedProcessServerChannel = @ptrCast(@alignCast(ptr));
-                const client = NamedProcessChannel.init(self.allocator, socket) catch return;
+            fn f(ptr: *anyopaque, socket: *Socket) void {
+                const self: *IpcServerChannel = @ptrCast(@alignCast(ptr));
+                const client = IpcChannel.init(self.allocator, socket) catch return;
                 self.delegate.onConnection(&self.base, &client.base);
             }
         }.f,
         .onClose = struct {
             fn f(ptr: *anyopaque) void {
-                const self: *NamedProcessServerChannel = @ptrCast(@alignCast(ptr));
+                const self: *IpcServerChannel = @ptrCast(@alignCast(ptr));
                 self.delegate.onClose(&self.base);
             }
         }.f,
     };
 };
 
-pub const NamedProcessChannel = struct {
+pub const IpcChannel = struct {
     // the base channel
     base: Channel,
     allocator: std.mem.Allocator,
-    connection: *NamedSocket,
-    socket_delegate: NamedSocketDelegate,
+    connection: *Socket,
+    socket_delegate: SocketDelegate,
     delegate: ?*ChannelDelegate,
 
     pub fn init(
         allocator: std.mem.Allocator,
-        connection: *NamedSocket,
-    ) !*NamedProcessChannel {
-        const self = try allocator.create(NamedProcessChannel);
+        connection: *Socket,
+    ) !*IpcChannel {
+        const self = try allocator.create(IpcChannel);
         self.* = .{
             .allocator = allocator,
             .connection = connection,
@@ -128,7 +134,7 @@ pub const NamedProcessChannel = struct {
         return self;
     }
 
-    pub fn setDelegate(self: *NamedProcessChannel, delegate: ?*ChannelDelegate) void {
+    pub fn setDelegate(self: *IpcChannel, delegate: ?*ChannelDelegate) void {
         self.delegate = delegate;
         if (delegate == null) {
             self.connection.setDelegate(null);
@@ -137,116 +143,116 @@ pub const NamedProcessChannel = struct {
         }
     }
 
-    pub fn deinit(self: *NamedProcessChannel) void {
+    pub fn deinit(self: *IpcChannel) void {
         self.connection.deinit();
         self.allocator.destroy(self);
     }
 
-    pub fn channel(self: *NamedProcessChannel) *Channel {
+    pub fn channel(self: *IpcChannel) *Channel {
         return &self.base;
     }
 
-    pub fn mode(self: *NamedProcessChannel) ChannelMode {
+    pub fn mode(self: *IpcChannel) ChannelMode {
         _ = self;
         return .CLIENT;
     }
 
-    pub fn upgrade(self: *NamedProcessChannel) void {
+    pub fn upgrade(self: *IpcChannel) void {
         _ = self;
     }
 
-    pub fn send(self: *NamedProcessChannel, frame: *Frame) void {
+    pub fn send(self: *IpcChannel, frame: *Frame) void {
         _ = self;
         _ = frame;
     }
 
-    pub fn flush(self: *NamedProcessChannel) void {
+    pub fn flush(self: *IpcChannel) void {
         _ = self;
     }
 
-    pub fn close(self: *NamedProcessChannel) void {
+    pub fn close(self: *IpcChannel) void {
         self.connection.close();
     }
 
     const vtable = Channel.VTable{
         .mode = struct {
             fn f(ptr: *anyopaque) ChannelMode {
-                const self: *NamedProcessChannel = @ptrCast(@alignCast(ptr));
+                const self: *IpcChannel = @ptrCast(@alignCast(ptr));
                 return self.mode();
             }
         }.f,
         .upgrade = struct {
             fn f(ptr: *anyopaque) void {
-                const self: *NamedProcessChannel = @ptrCast(@alignCast(ptr));
+                const self: *IpcChannel = @ptrCast(@alignCast(ptr));
                 return self.upgrade();
             }
         }.f,
         .send = struct {
             fn f(ptr: *anyopaque, frame: *Frame) void {
-                const self: *NamedProcessChannel = @ptrCast(@alignCast(ptr));
+                const self: *IpcChannel = @ptrCast(@alignCast(ptr));
                 self.send(frame);
             }
         }.f,
         .flush = struct {
             fn f(ptr: *anyopaque) void {
-                const self: *NamedProcessChannel = @ptrCast(@alignCast(ptr));
+                const self: *IpcChannel = @ptrCast(@alignCast(ptr));
                 self.flush();
             }
         }.f,
         .close = struct {
             fn f(ptr: *anyopaque) void {
-                const self: *NamedProcessChannel = @ptrCast(@alignCast(ptr));
+                const self: *IpcChannel = @ptrCast(@alignCast(ptr));
                 self.close();
             }
         }.f,
     };
 
-    const socket_delegate_vtable = NamedSocketDelegate.VTable{
+    const socket_delegate_vtable = SocketDelegate.VTable{
         .onConnection = struct {
             fn f(ptr: *anyopaque) void {
-                const self: *NamedProcessChannel = @ptrCast(@alignCast(ptr));
+                const self: *IpcChannel = @ptrCast(@alignCast(ptr));
                 if (self.delegate) |d| d.onConnection(&self.base);
             }
         }.f,
         .onConnectionFailed = struct {
             fn f(ptr: *anyopaque, err: IO.ConnectError) void {
-                const self: *NamedProcessChannel = @ptrCast(@alignCast(ptr));
+                const self: *IpcChannel = @ptrCast(@alignCast(ptr));
                 if (self.delegate) |d| d.onConnectionFailed(&self.base, err);
             }
         }.f,
         .onDisconnect = struct {
             fn f(ptr: *anyopaque) void {
-                const self: *NamedProcessChannel = @ptrCast(@alignCast(ptr));
+                const self: *IpcChannel = @ptrCast(@alignCast(ptr));
                 if (self.delegate) |d| d.onDisconnect(&self.base);
             }
         }.f,
         .onRecv = struct {
             fn f(ptr: *anyopaque, buffer: *IOBuffer) void {
-                const self: *NamedProcessChannel = @ptrCast(@alignCast(ptr));
+                const self: *IpcChannel = @ptrCast(@alignCast(ptr));
                 if (self.delegate) |d| d.onReceive(&self.base, buffer);
             }
         }.f,
         .onRecvFailed = struct {
             fn f(ptr: *anyopaque, err: IO.RecvError) void {
-                const self: *NamedProcessChannel = @ptrCast(@alignCast(ptr));
+                const self: *IpcChannel = @ptrCast(@alignCast(ptr));
                 if (self.delegate) |d| d.onReceiveFailed(&self.base, err);
             }
         }.f,
         .onSend = struct {
             fn f(ptr: *anyopaque, sent: usize) void {
-                const self: *NamedProcessChannel = @ptrCast(@alignCast(ptr));
+                const self: *IpcChannel = @ptrCast(@alignCast(ptr));
                 if (self.delegate) |d| d.onSend(&self.base, sent);
             }
         }.f,
         .onSendFailed = struct {
             fn f(ptr: *anyopaque, err: IO.SendError) void {
-                const self: *NamedProcessChannel = @ptrCast(@alignCast(ptr));
+                const self: *IpcChannel = @ptrCast(@alignCast(ptr));
                 if (self.delegate) |d| d.onSendFailed(&self.base, err);
             }
         }.f,
         .onClose = struct {
             fn f(ptr: *anyopaque) void {
-                const self: *NamedProcessChannel = @ptrCast(@alignCast(ptr));
+                const self: *IpcChannel = @ptrCast(@alignCast(ptr));
                 if (self.delegate) |d| d.onConnectionClosed(&self.base);
             }
         }.f,

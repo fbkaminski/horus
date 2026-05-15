@@ -2,6 +2,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 // net
+const socket = @import("net/socket.zig");
 const named_socket = @import("net/named_socket.zig");
 const io_buffer = @import("net/io_buffer.zig");
 // core
@@ -24,7 +25,7 @@ const io_file = if (builtin.os.tag == .linux) @import("io/linux.zig") else @impo
 pub const IOBuffer = io_buffer.IOBuffer;
 pub const IOBufferPool = io_buffer.IOBufferPool;
 pub const NamedSocket = named_socket.NamedSocket;
-pub const NamedSocketDelegate = named_socket.NamedSocketDelegate;
+pub const SocketDelegate = socket.SocketDelegate;
 pub const SingleThreadTaskRunner = thread.SingleThreadTaskRunner;
 pub const RunLoop = run_loop.RunLoop;
 pub const ShutdownTask = run_loop.ShutdownTask;

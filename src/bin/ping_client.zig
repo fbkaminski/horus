@@ -5,13 +5,15 @@ const SingleThreadTaskRunner = horus.SingleThreadTaskRunner;
 const RunLoop = horus.RunLoop;
 const ThreadRegistry = horus.ThreadRegistry;
 const NamedSocket = horus.NamedSocket;
-const NamedSocketDelegate = horus.NamedSocketDelegate;
+const SocketDelegate = horus.SocketDelegate;
 const IOBuffer = horus.IOBuffer;
 const IOBufferPool = horus.IOBufferPool;
 const Task = horus.Task;
 const TaskQueue = horus.TaskQueue;
 const ShutdownTask = horus.ShutdownTask;
 const IO = horus.IO;
+
+const MAX_PINGS = 11;
 
 pub fn main() !void {
     var gpa = std.heap.DebugAllocator(.{}){};
@@ -38,13 +40,11 @@ pub fn main() !void {
     ping_callback.deinit(alloc);
 }
 
-const MAX_PINGS = 12;
-
 const PingTask = struct {
     allocator: std.mem.Allocator,
     task: Task,
     node: TaskQueue.Node = .{ .value = undefined },
-    delegate: NamedSocketDelegate,
+    delegate: SocketDelegate,
     socket: ?*NamedSocket,
     task_runner: *SingleThreadTaskRunner,
     shutdown_task: *ShutdownTask,
@@ -105,10 +105,11 @@ const PingTask = struct {
 
     fn connect(self: *PingTask) void {
         std.log.info("connecting to /tmp/dht_host.sock..", .{});
-        self.socket = NamedSocket.init(self.allocator, &self.task_runner.io);
+        self.socket = self.allocator.create(NamedSocket) catch return;
         if (self.socket) |s| {
+            s.init(self.allocator, &self.task_runner.io, &self.task_runner.pool);
             s.setDelegate(&self.delegate);
-            s.connect("/tmp/dht_host.sock") catch return;
+            s.connect(.{ .path = "/tmp/dht_host.sock" });
         }
     }
 
@@ -177,7 +178,7 @@ const PingTask = struct {
         self.task_runner.postTask(&self.shutdown_task.node);
     }
 
-    const delegate_vtable = NamedSocketDelegate.VTable{
+    const delegate_vtable = SocketDelegate.VTable{
         .onConnection = struct {
             fn f(ptr: *anyopaque) void {
                 const self: *PingTask = @ptrCast(@alignCast(ptr));

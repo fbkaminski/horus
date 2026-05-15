@@ -7,7 +7,7 @@ const thread_registry_file = @import("../core/thread_registry.zig");
 const work_queue = @import("../core/work_queue.zig");
 const service_file = @import("service.zig");
 const channel_file = @import("../channel/channel.zig");
-const named_channel_file = @import("../channel/named_process_channel.zig");
+const ipc_channel_file = @import("../channel/ipc_channel.zig");
 const io_buffer = @import("../net/io_buffer.zig");
 const io_file = if (builtin.os.tag == .linux) @import("../io/linux.zig") else @import("../io/darwin.zig");
 const IO = io_file.IO;
@@ -26,8 +26,8 @@ const Channel = channel_file.Channel;
 const ChannelListener = channel_file.ChannelListener;
 const ChannelListenerDelegate = channel_file.ChannelListenerDelegate;
 const ChannelDelegate = channel_file.ChannelDelegate;
-const NamedProcessChannel = named_channel_file.NamedProcessChannel;
-const NamedProcessServerChannel = named_channel_file.NamedProcessServerChannel;
+const IpcChannel = ipc_channel_file.IpcChannel;
+const IpcServerChannel = ipc_channel_file.IpcServerChannel;
 
 const SERVICE_MANAGER_SOCKET_PATH: []const u8 = "/tmp/dht_host.sock";
 
@@ -42,7 +42,7 @@ pub const ServiceManager = struct {
     task_runner: SingleThreadTaskRunner,
     services: std.AutoHashMap(ServiceId, ServiceHandle),
     last_service_id: ServiceId,
-    server_channel: NamedProcessServerChannel,
+    server_channel: IpcServerChannel,
     state: ServiceManagerState,
     clients: ClientContextPool,
     server_delegate: ChannelListenerDelegate,
@@ -60,7 +60,7 @@ pub const ServiceManager = struct {
             .vtable = &delegate_vtable,
         };
         try self.task_runner.init(allocator, thread_registry, .service);
-        try self.server_channel.init(allocator, SERVICE_MANAGER_SOCKET_PATH, &self.task_runner.io, &self.server_delegate);
+        try self.server_channel.init(allocator, &self.task_runner.io, &self.task_runner.pool, &self.server_delegate);
     }
 
     pub fn start(self: *ServiceManager) !void {
@@ -77,6 +77,7 @@ pub const ServiceManager = struct {
     pub fn deinit(self: *ServiceManager) void {
         self.clients.deinit();
         self.server_channel.close();
+        self.server_channel.deinit();
         self.task_runner.deinit();
     }
 
@@ -99,7 +100,7 @@ pub const ServiceManager = struct {
 
     fn spawnOnThread(self: *ServiceManager) !void {
         std.debug.assert(self.task_runner.isCurrentThread());
-        try self.server_channel.serve();
+        self.server_channel.serve(SERVICE_MANAGER_SOCKET_PATH);
         self.state = .running;
         try self.task_runner.run();
         self.state = .stopped;
@@ -113,7 +114,7 @@ pub const ServiceManager = struct {
     fn onConnection(self: *ServiceManager, channel: *Channel) void {
         std.debug.assert(self.task_runner.isCurrentThread());
         std.log.info("ServiceManager.onConnection: new client connection", .{});
-        const named_process_channel: *NamedProcessChannel = @fieldParentPtr("base", channel);
+        const named_process_channel: *IpcChannel = @fieldParentPtr("base", channel);
         const client_context = self.allocator.create(ClientContext) catch return;
         client_context.init(self, &self.task_runner, named_process_channel);
         // add into the pool
@@ -156,14 +157,14 @@ const ClientContext = struct {
     allocator: std.mem.Allocator,
     service_manager: *ServiceManager,
     task_runner: *SingleThreadTaskRunner,
-    channel: *NamedProcessChannel,
+    channel: *IpcChannel,
     read_cb: ReadCallback,
     write_buffer: *IOBuffer,
     delegate: ChannelDelegate,
     // a silly way of measuring pings
     ping: usize,
 
-    pub fn init(self: *ClientContext, manager: *ServiceManager, task_runner: *SingleThreadTaskRunner, channel: *NamedProcessChannel) void {
+    pub fn init(self: *ClientContext, manager: *ServiceManager, task_runner: *SingleThreadTaskRunner, channel: *IpcChannel) void {
         self.service_manager = manager;
         self.allocator = self.service_manager.allocator;
         self.task_runner = task_runner;
@@ -192,7 +193,7 @@ const ClientContext = struct {
         };
         // define ourselves as the delegate of the client channel
         self.channel.setDelegate(&self.delegate);
-        self.write_buffer = self.channel.connection.buffer_pool.acquire() catch return;
+        self.write_buffer = self.task_runner.pool.acquire() catch return;
     }
 
     pub fn deinit(self: *ClientContext) void {
@@ -225,7 +226,7 @@ const ClientContext = struct {
         std.debug.assert(self.task_runner.isCurrentThread());
         //std.debug.assert(client == self.channel);
         std.log.info("Service manager: client connection closed.", .{});
-        //var named_client: *NamedProcessChannel = @ptrCast(client);
+        //var named_client: *IpcChannel = @ptrCast(client);
         // named_client.deinit();
         // clean ourselves
         self.deinit();
@@ -276,7 +277,7 @@ const ClientContext = struct {
         self.task_runner.postTaskTo(.service, &self.read_cb.response_node);
     }
 
-    fn processIncomingDataReplyOnServiceThread(self: *ClientContext, client: *NamedProcessChannel) void {
+    fn processIncomingDataReplyOnServiceThread(self: *ClientContext, client: *IpcChannel) void {
         std.debug.assert(self.task_runner.isCurrentThread());
         std.log.info("Service manager: processing response on {d}\n", .{std.Thread.getCurrentId()});
         if (self.ping > 0) {
@@ -345,7 +346,7 @@ const ClientContext = struct {
         response_task: Task,
         response_node: TaskQueue.Node = .{ .value = undefined },
         context: *ClientContext,
-        channel: *NamedProcessChannel,
+        channel: *IpcChannel,
         buffer: ?*IOBuffer,
 
         fn callback(task: *Task) void {

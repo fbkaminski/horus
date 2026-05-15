@@ -58,7 +58,7 @@ pub const ChannelListener = struct {
     pub const VTable = struct {
         mode: *const fn (ptr: *anyopaque) ChannelMode,
         close: *const fn (ptr: *anyopaque) void,
-        listen: *const fn (ptr: *anyopaque) void,
+        listen: *const fn (ptr: *anyopaque, path: []const u8) void,
     };
 
     pub fn listen(self: ChannelListener) void {

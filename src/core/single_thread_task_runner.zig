@@ -4,19 +4,21 @@ const base = @import("base.zig");
 const task_runner_file = @import("task_runner.zig");
 const runloop = @import("run_loop.zig");
 const thread_registry_file = @import("thread_registry.zig");
+const io_buffer = @import("../net/io_buffer.zig");
+const IO = @import("../io/io.zig").IO;
 const TaskQueue = base.TaskQueue;
 const Task = base.Task;
-const io_file = if (builtin.os.tag == .linux) @import("../io/linux.zig") else @import("../io/darwin.zig");
-const IO = io_file.IO;
 const TaskRunner = task_runner_file.TaskRunner;
 const ThreadRegistry = thread_registry_file.ThreadRegistry;
 const ThreadId = base.ThreadId;
 const RunLoopDelegate = runloop.RunLoopDelegate;
+const IOBufferPool = io_buffer.IOBufferPool;
 
 threadlocal var current_task_runner: ?*SingleThreadTaskRunner = undefined;
 
 pub const SingleThreadTaskRunner = struct {
     allocator: std.mem.Allocator,
+    pool: IOBufferPool,
     handle: ?std.Thread = null,
     entry: Entry,
     registry: *ThreadRegistry,
@@ -42,6 +44,7 @@ pub const SingleThreadTaskRunner = struct {
     pub fn init(self: *SingleThreadTaskRunner, allocator: std.mem.Allocator, registry: *ThreadRegistry, thread_type: ThreadId) !void {
         self.is_main = thread_type == .main;
         self.spawned = false;
+        self.pool = IOBufferPool.init(allocator, .{});
         self.allocator = allocator;
         self.registry = registry;
         self.entry = .{
@@ -80,6 +83,7 @@ pub const SingleThreadTaskRunner = struct {
         if (comptime builtin.os.tag == .linux) {
             std.posix.close(self.wake_event);
         }
+        self.pool.deinit();
     }
 
     pub fn isCurrentThread(self: *SingleThreadTaskRunner) bool {
