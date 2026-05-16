@@ -1,18 +1,17 @@
 const std = @import("std");
 const builtin = @import("builtin");
-const io_buffer = @import("io_buffer.zig");
-const socket_file = @import("socket.zig");
-const Socket = socket_file.Socket;
-const SocketConnectionArgs = socket_file.SocketConnectionArgs;
-const ServerSocketListenArgs = socket_file.ServerSocketListenArgs;
-const ServerSocket = socket_file.ServerSocket;
-const SocketDelegate = socket_file.SocketDelegate;
-const ServerSocketDelegate = socket_file.ServerSocketDelegate;
-const SocketState = socket_file.SocketState;
-const ServerSocketState = socket_file.ServerSocketState;
+const net_file = @import("net.zig");
+const Socket = net_file.Socket;
+const SocketConnectionArgs = net_file.SocketConnectionArgs;
+const ServerSocketListenArgs = net_file.ServerSocketListenArgs;
+const ServerSocket = net_file.ServerSocket;
+const SocketDelegate = net_file.SocketDelegate;
+const ServerSocketDelegate = net_file.ServerSocketDelegate;
+const SocketState = net_file.SocketState;
+const ServerSocketState = net_file.ServerSocketState;
 const IO = @import("../io/io.zig").IO;
-const IOBuffer = io_buffer.IOBuffer;
-const IOBufferPool = io_buffer.IOBufferPool;
+const IOBuffer = net_file.IOBuffer;
+const IOBufferPool = net_file.IOBufferPool;
 
 pub const NamedSocket = struct {
     base: Socket,

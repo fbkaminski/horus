@@ -1,19 +1,15 @@
 const std = @import("std");
 const posix = std.posix;
-const base = @import("../core/base.zig");
-const thread = @import("../core/single_thread_task_runner.zig");
-const thread_pool = @import("../core/thread_pool_task_runner.zig");
-const task_runner = @import("../core/task_runner.zig");
-const run_loop_file = @import("../core/run_loop.zig");
-const thread_registry_file = @import("../core/thread_registry.zig");
-const service_manager = @import("service_manager.zig");
-const SingleThreadTaskRunner = thread.SingleThreadTaskRunner;
-const ThreadPoolTaskRunner = thread_pool.ThreadPoolTaskRunner;
-const ServiceManager = service_manager.ServiceManager;
-const TaskRunner = task_runner.TaskRunner;
-const ThreadRegistry = thread_registry_file.ThreadRegistry;
-const RunLoop = run_loop_file.RunLoop;
-const RunLoopDelegate = run_loop_file.RunLoopDelegate;
+const core = @import("../core/core.zig");
+const net_file = @import("../net/net.zig");
+const server_file = @import("server.zig");
+const SingleThreadTaskRunner = core.SingleThreadTaskRunner;
+const ThreadPoolTaskRunner = core.ThreadPoolTaskRunner;
+const ServiceManager = server_file.ServiceManager;
+const TaskRunner = core.TaskRunner;
+const ThreadRegistry = core.ThreadRegistry;
+const RunLoop = core.RunLoop;
+const RunLoopDelegate = core.RunLoopDelegate;
 
 // globals
 var g_platform: ?*Platform = undefined;

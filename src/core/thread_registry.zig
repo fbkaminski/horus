@@ -1,8 +1,7 @@
-const base = @import("base.zig");
-const task_runner_file = @import("task_runner.zig");
+const core = @import("core.zig");
 const std = @import("std");
-const ThreadId = base.ThreadId;
-const TaskRunner = task_runner_file.TaskRunner;
+const ThreadId = core.ThreadId;
+const TaskRunner = core.TaskRunner;
 
 //
 pub const ThreadRegistry = struct {

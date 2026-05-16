@@ -1,7 +1,7 @@
 const std = @import("std");
-const base = @import("../core/base.zig");
-const Task = base.Task;
-const TaskQueue = base.TaskQueue;
+const core = @import("../core/core.zig");
+const Task = core.Task;
+const TaskQueue = core.TaskQueue;
 
 const timeout_ms = 10 * std.time.ns_per_ms;
 

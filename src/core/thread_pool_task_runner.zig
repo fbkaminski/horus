@@ -1,12 +1,10 @@
-const base = @import("base.zig");
 const std = @import("std");
-const task_runner_file = @import("task_runner.zig");
-const thread_registry_file = @import("thread_registry.zig");
-const ThreadId = base.ThreadId;
-const TaskRunner = task_runner_file.TaskRunner;
-const Task = base.Task;
-const TaskQueue = base.TaskQueue;
-const ThreadRegistry = thread_registry_file.ThreadRegistry;
+const core = @import("core.zig");
+const ThreadId = core.ThreadId;
+const TaskRunner = core.TaskRunner;
+const Task = core.Task;
+const TaskQueue = core.TaskQueue;
+const ThreadRegistry = core.ThreadRegistry;
 
 pub const ThreadPoolTaskRunner = struct {
     registry: *ThreadRegistry,

@@ -2,19 +2,13 @@
 const std = @import("std");
 const builtin = @import("builtin");
 // net
-const socket = @import("net/socket.zig");
-const named_socket = @import("net/named_socket.zig");
-const io_buffer = @import("net/io_buffer.zig");
+const net = @import("net/net.zig");
 // core
-const base = @import("core/base.zig");
-const thread = @import("core/single_thread_task_runner.zig");
-const run_loop = @import("core/run_loop.zig");
-const thread_registry = @import("core/thread_registry.zig");
+const core = @import("core/core.zig");
+// server
+const server = @import("server/server.zig");
 
-// platform
-const platform = @import("server/platform.zig");
-
-const io_file = if (builtin.os.tag == .linux) @import("io/linux.zig") else @import("io/darwin.zig");
+const io_file = @import("io/io.zig");
 
 // dht
 //const err = @import("dht/error.zig");
@@ -22,16 +16,16 @@ const io_file = if (builtin.os.tag == .linux) @import("io/linux.zig") else @impo
 //const message = @import("dht/message.zig");
 //const routing_table = @import("dht/routing_table.zig");
 
-pub const IOBuffer = io_buffer.IOBuffer;
-pub const IOBufferPool = io_buffer.IOBufferPool;
-pub const NamedSocket = named_socket.NamedSocket;
-pub const SocketDelegate = socket.SocketDelegate;
-pub const SingleThreadTaskRunner = thread.SingleThreadTaskRunner;
-pub const RunLoop = run_loop.RunLoop;
-pub const ShutdownTask = run_loop.ShutdownTask;
+pub const IOBuffer = net.IOBuffer;
+pub const IOBufferPool = net.IOBufferPool;
+pub const NamedSocket = net.NamedSocket;
+pub const SocketDelegate = net.SocketDelegate;
+pub const SingleThreadTaskRunner = core.SingleThreadTaskRunner;
+pub const RunLoop = core.RunLoop;
+pub const ShutdownTask = core.ShutdownTask;
 
-pub const Platform = platform.Platform;
-pub const ThreadRegistry = thread_registry.ThreadRegistry;
-pub const Task = base.Task;
-pub const TaskQueue = base.TaskQueue;
+pub const Platform = server.Platform;
+pub const ThreadRegistry = core.ThreadRegistry;
+pub const Task = core.Task;
+pub const TaskQueue = core.TaskQueue;
 pub const IO = io_file.IO;

@@ -1,7 +1,7 @@
-const base = @import("base.zig");
-const ThreadId = base.ThreadId;
-const Task = base.Task;
-const TaskQueue = base.TaskQueue;
+const core = @import("core.zig");
+const ThreadId = core.ThreadId;
+const Task = core.Task;
+const TaskQueue = core.TaskQueue;
 
 pub const TaskRunner = struct {
     ptr: *anyopaque,

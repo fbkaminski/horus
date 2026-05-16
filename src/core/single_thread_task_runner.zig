@@ -1,18 +1,15 @@
 const std = @import("std");
 const builtin = @import("builtin");
-const base = @import("base.zig");
-const task_runner_file = @import("task_runner.zig");
-const runloop = @import("run_loop.zig");
-const thread_registry_file = @import("thread_registry.zig");
-const io_buffer = @import("../net/io_buffer.zig");
+const core = @import("core.zig");
+const net = @import("../net/net.zig");
 const IO = @import("../io/io.zig").IO;
-const TaskQueue = base.TaskQueue;
-const Task = base.Task;
-const TaskRunner = task_runner_file.TaskRunner;
-const ThreadRegistry = thread_registry_file.ThreadRegistry;
-const ThreadId = base.ThreadId;
-const RunLoopDelegate = runloop.RunLoopDelegate;
-const IOBufferPool = io_buffer.IOBufferPool;
+const TaskQueue = core.TaskQueue;
+const Task = core.Task;
+const TaskRunner = core.TaskRunner;
+const ThreadRegistry = core.ThreadRegistry;
+const ThreadId = core.ThreadId;
+const RunLoopDelegate = core.RunLoopDelegate;
+const IOBufferPool = net.IOBufferPool;
 
 threadlocal var current_task_runner: ?*SingleThreadTaskRunner = undefined;
 

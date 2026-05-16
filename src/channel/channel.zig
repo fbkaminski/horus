@@ -1,16 +1,20 @@
 //
 const std = @import("std");
 const builtin = @import("builtin");
-const io_buffer = @import("../net/io_buffer.zig");
-const io_file = if (builtin.os.tag == .linux) @import("../io/linux.zig") else @import("../io/darwin.zig");
+const net = @import("../net/net.zig");
 const frame_file = @import("frame.zig");
-const Frame = frame_file.Frame;
-const IOBuffer = io_buffer.IOBuffer;
+const ipc_channel = @import("ipc_channel.zig");
+
+// exports
+pub const Frame = frame_file.Frame;
+pub const IpcChannel = ipc_channel.IpcChannel;
+pub const IpcServerChannel = ipc_channel.IpcServerChannel;
+
 // FIXME: the IO layer shouldnt leak here
 //        its here for the error messages
 // TODO:  create internal error messages
-//
-const IO = io_file.IO;
+const IO = @import("../io/io.zig").IO;
+const IOBuffer = net.IOBuffer;
 
 pub const ChannelMode = enum {
     SERVER,

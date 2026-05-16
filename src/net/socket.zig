@@ -1,6 +1,6 @@
 const std = @import("std");
 const IO = @import("../io/io.zig").IO;
-const IOBuffer = @import("io_buffer.zig").IOBuffer;
+const IOBuffer = @import("net.zig").IOBuffer;
 
 pub const SocketState = enum {
     init,
